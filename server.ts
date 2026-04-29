@@ -39,6 +39,7 @@ const STATE_DIR =
 const ENV_FILE = join(STATE_DIR, '.env')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
+const PROFILE_MARKER = join(STATE_DIR, '.profile-set')
 
 const STATIC = process.env.SIGNAL_ACCESS_MODE === 'static'
 const APPEND_SIGNATURE = process.env.SIGNAL_APPEND_SIGNATURE === 'true'
@@ -342,6 +343,9 @@ function chatIdFor(env: SignalEnvelope): string {
 
 function recipientParams(chatId: string): Record<string, unknown> {
   if (chatId.startsWith('group:')) return { groupId: chatId.slice(6) }
+  // Signal usernames are nickname.discriminator (3-32 chars + 2+ digits).
+  // UUIDs contain `-` and phones start with `+`, so neither will match.
+  if (/^[a-z][a-z0-9_]{2,31}\.\d{2,}$/.test(chatId)) return { username: chatId }
   return { recipient: [chatId] }
 }
 
@@ -775,9 +779,33 @@ function spawnSignalCli(): void {
   // through the JSON-RPC pipe; the dispatcher subscribes internally but
   // envelopes don't surface. Single-account is the well-trodden path.
   const child = spawn(SIGNAL_CLI, ['-a', currentAccount, 'jsonRpc'], {
-    stdio: ['pipe', 'pipe', 'inherit'],
+    stdio: ['pipe', 'pipe', 'pipe'],
   })
   proc = child
+
+  // signal-cli prints "Config file is in use, waiting…" synchronously on lock
+  // contention and then blocks indefinitely. We pipe stderr so we can detect
+  // that one line and exit fast, instead of letting MCP's retry loop pile up
+  // Java processes. Every other line is forwarded verbatim.
+  let stderrBuf = ''
+  child.stderr.setEncoding('utf8')
+  child.stderr.on('data', (chunk: string) => {
+    stderrBuf += chunk
+    let nl: number
+    while ((nl = stderrBuf.indexOf('\n')) >= 0) {
+      const line = stderrBuf.slice(0, nl)
+      stderrBuf = stderrBuf.slice(nl + 1)
+      if (/Config file is in use, waiting/i.test(line)) {
+        process.stderr.write(
+          'signal channel: account lock held by another signal-cli — exiting fast to avoid retry pile-up\n',
+        )
+        shuttingDown = true
+        child.kill('SIGTERM')
+        process.exit(2)
+      }
+      process.stderr.write(line + '\n')
+    }
+  })
 
   let stdoutBuf = ''
   child.stdout.setEncoding('utf8')
@@ -841,6 +869,66 @@ function spawnSignalCli(): void {
   })
 }
 
+// --- stale-bridge cleanup ----------------------------------------------------
+
+// On boot, kill any orphan bridges holding a signal-cli lockfile. The Item 1
+// shutdown hook prevents NEW orphans, but existing ones from older bridge
+// versions or crashed sessions still pile up. We identify a stale bridge as a
+// (bun parent, signal-cli child) pair where the child is in jsonRpc mode.
+// A user-launched `signal-cli ... jsonRpc` (no bun parent) is never touched.
+// This MUST run before resolveAccount() — `signal-cli listAccounts` itself
+// blocks on the global accounts lock when an orphan holds it, so we'd hang
+// trying to learn our own account.
+function cleanupStaleBridges(): void {
+  const myUser = process.env.USER ?? ''
+  if (!myUser) return
+  const ps = spawnSync('ps', ['-u', myUser, '-o', 'pid=,ppid=,command='], {
+    encoding: 'utf8',
+  })
+  if (ps.status !== 0) return
+
+  type Proc = { pid: number; ppid: number; command: string }
+  const procs: Proc[] = []
+  for (const line of ps.stdout.split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line)
+    if (!m) continue
+    procs.push({ pid: Number(m[1]), ppid: Number(m[2]), command: m[3] })
+  }
+
+  const daemons = procs.filter(
+    p =>
+      p.pid !== process.pid &&
+      p.command.includes('org.asamk.signal.Main') &&
+      /\bjsonRpc\b/.test(p.command),
+  )
+  if (daemons.length === 0) return
+
+  const targets: number[] = []
+  for (const d of daemons) {
+    const parent = procs.find(p => p.pid === d.ppid)
+    if (!parent || parent.pid === process.pid) continue
+    if (!/\bbun\b/.test(parent.command)) {
+      process.stderr.write(
+        `signal channel: leaving daemon ${d.pid} alone (parent is not bun — likely user-launched)\n`,
+      )
+      continue
+    }
+    targets.push(parent.pid, d.pid)
+  }
+  if (targets.length === 0) return
+
+  for (const pid of targets) {
+    try {
+      process.kill(pid, 'SIGTERM')
+    } catch {}
+  }
+  process.stderr.write(
+    `signal channel: cleaned up ${targets.length} stale process(es): ${targets.join(', ')}\n`,
+  )
+  // Brief settle so the kernel releases the account lockfile before we spawn.
+  spawnSync('sleep', ['1'])
+}
+
 // --- account resolution ------------------------------------------------------
 
 // Resolves the account BEFORE spawning the long-lived jsonRpc daemon, via a
@@ -902,12 +990,64 @@ for (const sig of ['SIGTERM', 'SIGINT'] as const) {
 
 // --- startup orchestration ---------------------------------------------------
 
+// Cleanup BEFORE account resolution: `signal-cli listAccounts` itself blocks
+// on the global accounts lock that the orphan holds, so we'd hang at boot.
+cleanupStaleBridges()
+
 currentAccount = resolveAccount()
 OWNER = process.env.SIGNAL_OWNER ?? envFile.SIGNAL_OWNER ?? currentAccount
 
 spawnSignalCli()
 
+// Auto-set profile name on first boot. signal-cli has no command to read own
+// profile state (verified against ListAccountsCommand.java + the full v0.14.3
+// command surface — only updateProfile exists, no getter), so we use a marker
+// file storing the last-set name. Skip if marker matches configured name;
+// re-set if it differs (e.g. user changed SIGNAL_PROFILE_NAME). Empty value
+// disables. Fire-and-forget; never blocks startup, never fatal on failure.
+const PROFILE_NAME =
+  process.env.SIGNAL_PROFILE_NAME ?? envFile.SIGNAL_PROFILE_NAME ?? 'OpenClaw'
+
+if (PROFILE_NAME) {
+  ;(async () => {
+    try {
+      let prev = ''
+      try {
+        prev = readFileSync(PROFILE_MARKER, 'utf8').trim()
+      } catch {}
+      if (prev === PROFILE_NAME) return
+      await rpc('updateProfile', { givenName: PROFILE_NAME })
+      mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+      writeFileSync(PROFILE_MARKER, PROFILE_NAME, { mode: 0o600 })
+      process.stderr.write(`signal channel: profile name set to "${PROFILE_NAME}"\n`)
+    } catch (err) {
+      process.stderr.write(`signal channel: updateProfile failed (non-fatal): ${err}\n`)
+    }
+  })()
+}
+
 if (!STATIC) setInterval(checkApprovals, 5000).unref()
+
+// Claude Code closes our stdio transport on /exit. Without these hooks the
+// bridge keeps running and holds the signal-cli account lockfile, blocking
+// the next session from starting. Two paths:
+//   - mcp.onclose: fires when the Server's close() is called (clean MCP-level
+//     shutdown). Per StdioServerTransport.close() in @modelcontextprotocol/sdk.
+//   - stdin 'end' / 'close': fires when the host's stdio pipe EOFs (Claude
+//     Code /exit, host crash). The SDK only registers a 'data' listener on
+//     stdin, never 'end' — so without this, raw EOF goes unnoticed and we
+//     orphan. (Verified by reading dist/esm/server/stdio.js in v0.1 testing.)
+// Both funnel into the same shutdown shape as the SIGINT/SIGTERM handlers.
+function shutdownFromTransport(reason: string) {
+  if (shuttingDown) return
+  shuttingDown = true
+  process.stderr.write(`signal channel: ${reason}; shutting down\n`)
+  proc?.kill('SIGTERM')
+  process.exit(0)
+}
+mcp.onclose = () => shutdownFromTransport('MCP transport closed')
+process.stdin.on('end', () => shutdownFromTransport('stdin EOF'))
+process.stdin.on('close', () => shutdownFromTransport('stdin closed'))
 
 await mcp.connect(new StdioServerTransport())
 

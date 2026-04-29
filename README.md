@@ -34,6 +34,16 @@ if exactly one signal-cli account is linked, the bridge auto-detects it. if mult
 /signal:configure account +15551234567
 ```
 
+## profile name
+
+freshly registered signal-cli accounts have no profile, so messages from them show up as "unknown contact" until profile keys are exchanged. on first boot the bridge sets the profile name to `OpenClaw` for you. override the name via env or `.env`:
+
+```
+SIGNAL_PROFILE_NAME=Claude
+```
+
+set it to empty to disable. the bridge writes a marker file at `~/.claude/channels/signal/.profile-set` and only re-applies if the configured name changes — your signal profile won't be silently overwritten. delete the marker if you ever need to force a re-set.
+
 ## access control
 
 default policy is **pairing**. send a signal message to your account; the bridge replies with a 6-character code. in your claude code terminal, run:
