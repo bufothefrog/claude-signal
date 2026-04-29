@@ -589,7 +589,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: 'react',
       description:
         'React to a Signal message with an emoji. message_id is the timestamp of the target message; ' +
-        'the bridge resolves the target author from its in-memory map.',
+        'the bridge resolves the target author from its persistent message log.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -877,8 +877,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             `cannot mark_read: no inbound row for message_id ${messageId}.`,
           )
         }
+        // sendReceipt's CLI definition has `recipient` as a single positional
+        // (no nargs), unlike `send` which is multi-recipient. Wrapping in an
+        // array errors with "Failed to send message".
         await rpc('sendReceipt', {
-          recipient: [sender],
+          recipient: sender,
           type: 'read',
           targetTimestamp: [Number(messageId)],
         })
