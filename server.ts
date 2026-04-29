@@ -31,6 +31,7 @@ import {
 } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
+import { Database } from 'bun:sqlite'
 
 // --- paths + env -------------------------------------------------------------
 
@@ -40,6 +41,8 @@ const ENV_FILE = join(STATE_DIR, '.env')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const PROFILE_MARKER = join(STATE_DIR, '.profile-set')
+const MESSAGES_DB = join(STATE_DIR, 'messages.db')
+const AUTHORS_FILE = join(STATE_DIR, 'authors.json')
 
 const STATIC = process.env.SIGNAL_ACCESS_MODE === 'static'
 const APPEND_SIGNATURE = process.env.SIGNAL_APPEND_SIGNATURE === 'true'
@@ -58,6 +61,9 @@ process.on('unhandledRejection', err => {
 process.on('uncaughtException', err => {
   process.stderr.write(`signal channel: uncaught exception: ${err}\n`)
 })
+// Flush the coalesced authors map on any exit path. Synchronous file write,
+// so it completes inside 'exit' before the process actually terminates.
+process.on('exit', authorsFlush)
 
 // --- .env parser -------------------------------------------------------------
 
@@ -298,6 +304,173 @@ function consumeEcho(chatId: string, text: string): boolean {
   return true
 }
 
+// --- persistent storage ------------------------------------------------------
+
+// SQLite for chat history (unbounded, indexed). JSON for the authors index
+// (bounded, hand-inspectable, write-coalesced). Both rooted at STATE_DIR.
+
+function initDb(): Database {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+  const d = new Database(MESSAGES_DB, { create: true })
+  d.exec(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      message_id TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      sender_id TEXT NOT NULL,
+      text TEXT,
+      attachment_path TEXT,
+      ts INTEGER NOT NULL,
+      direction TEXT NOT NULL CHECK(direction IN ('in','out')),
+      edited_target INTEGER,
+      UNIQUE(message_id, direction)
+    );
+    CREATE INDEX IF NOT EXISTS messages_chat_ts ON messages(chat_id, ts);
+    CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender_id);
+    PRAGMA user_version = 1;
+  `)
+  return d
+}
+
+const db: Database = initDb()
+
+// --- authors index (richer messageAuthors replacement) ----------------------
+
+type AuthorEntry = {
+  display_name?: string
+  first_seen: number
+  last_seen: number
+  message_count: number
+}
+
+let authors: Record<string, AuthorEntry> = {}
+let authorsDirty = false
+let authorsFlushTimer: NodeJS.Timeout | null = null
+
+function authorsLoad(): void {
+  try {
+    authors = JSON.parse(readFileSync(AUTHORS_FILE, 'utf8'))
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      process.stderr.write(`signal channel: authors.json corrupt, starting fresh: ${err}\n`)
+    }
+    authors = {}
+  }
+}
+
+function authorsTouch(senderId: string, displayName: string | undefined, ts: number): void {
+  const cur: AuthorEntry =
+    authors[senderId] ?? { first_seen: ts, last_seen: ts, message_count: 0 }
+  cur.first_seen = Math.min(cur.first_seen, ts)
+  cur.last_seen = Math.max(cur.last_seen, ts)
+  cur.message_count++
+  if (displayName) cur.display_name = displayName
+  authors[senderId] = cur
+  authorsDirty = true
+  if (!authorsFlushTimer) {
+    authorsFlushTimer = setTimeout(authorsFlush, 5000)
+    authorsFlushTimer.unref?.()
+  }
+}
+
+function authorsFlush(): void {
+  if (authorsFlushTimer) {
+    clearTimeout(authorsFlushTimer)
+    authorsFlushTimer = null
+  }
+  if (!authorsDirty) return
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    const tmp = AUTHORS_FILE + '.tmp'
+    writeFileSync(tmp, JSON.stringify(authors, null, 2) + '\n', { mode: 0o600 })
+    renameSync(tmp, AUTHORS_FILE)
+    authorsDirty = false
+  } catch (err) {
+    process.stderr.write(`signal channel: authors flush failed: ${err}\n`)
+  }
+}
+
+authorsLoad()
+
+// --- message capture --------------------------------------------------------
+
+// All outbound sends route through here — this both seeds the echo filter and
+// inserts the row into messages. Replaces the bare trackEcho call.
+function recordSent(
+  chatId: string,
+  text: string,
+  ts: number,
+  attachmentPath?: string,
+  editedTarget?: number,
+): void {
+  trackEcho(chatId, text)
+  try {
+    db.run(
+      `INSERT OR IGNORE INTO messages
+       (message_id, chat_id, sender_id, text, attachment_path, ts, direction, edited_target)
+       VALUES (?, ?, ?, ?, ?, ?, 'out', ?)`,
+      [
+        String(ts),
+        chatId,
+        currentAccount,
+        text || null,
+        attachmentPath ?? null,
+        ts,
+        editedTarget ?? null,
+      ],
+    )
+  } catch (err) {
+    process.stderr.write(`signal channel: recordSent insert failed: ${err}\n`)
+  }
+}
+
+function recordReceived(
+  messageId: string,
+  chatId: string,
+  senderId: string,
+  text: string,
+  ts: number,
+  sourceName: string | undefined,
+  attachmentPath?: string,
+  editedTarget?: number,
+): void {
+  try {
+    db.run(
+      `INSERT OR IGNORE INTO messages
+       (message_id, chat_id, sender_id, text, attachment_path, ts, direction, edited_target)
+       VALUES (?, ?, ?, ?, ?, ?, 'in', ?)`,
+      [
+        messageId,
+        chatId,
+        senderId,
+        text || null,
+        attachmentPath ?? null,
+        ts,
+        editedTarget ?? null,
+      ],
+    )
+    authorsTouch(senderId, sourceName, ts)
+  } catch (err) {
+    process.stderr.write(`signal channel: recordReceived insert failed: ${err}\n`)
+  }
+}
+
+// Replaces the in-memory messageAuthors Map. Cross-session reactions now work
+// because the row survives bridge restart.
+function authorByMessageId(messageId: string): string | undefined {
+  try {
+    const row = db
+      .query<{ sender_id: string }, [string]>(
+        `SELECT sender_id FROM messages WHERE message_id = ? AND direction = 'in' LIMIT 1`,
+      )
+      .get(messageId)
+    return row?.sender_id
+  } catch (err) {
+    process.stderr.write(`signal channel: authorByMessageId lookup failed: ${err}\n`)
+    return undefined
+  }
+}
+
 // --- envelope shape ----------------------------------------------------------
 
 type SignalDataMessage = {
@@ -375,13 +548,6 @@ const mcp = new Server(
   },
 )
 
-// Tracks sender per inbound message_id so quote-replies and reactions can
-// supply the targetAuthor / quoteAuthor that signal-cli requires alongside
-// the timestamp. In-memory only; cross-session quoting silently drops the
-// author for quotes (signal-cli falls back gracefully) and errors for
-// reactions (which require it).
-const messageAuthors = new Map<string, string>()
-
 // --- tools advertised --------------------------------------------------------
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -446,6 +612,53 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           stop: { type: 'boolean' },
         },
         required: ['chat_id'],
+      },
+    },
+    {
+      name: 'chat_messages',
+      description:
+        "Query the bridge's persistent message history. " +
+        'Returns inbound and outbound messages stored since v0.3 install — ' +
+        'messages from before then are NOT in the cache. ' +
+        'Filter by chat_id (omit for global), since/until (ISO timestamp or ms epoch), ' +
+        'search (case-insensitive substring on text), and limit (default 50, max 500). ' +
+        'Results ordered newest-first.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          since: { type: 'string' },
+          until: { type: 'string' },
+          search: { type: 'string' },
+          limit: { type: 'number' },
+        },
+      },
+    },
+    {
+      name: 'list_contacts',
+      description:
+        'List signal-cli contacts. Optional match filters by case-insensitive substring on name/number/uuid. ' +
+        'Useful for finding the chat_id of someone you want to message.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          match: { type: 'string' },
+        },
+      },
+    },
+    {
+      name: 'mark_read',
+      description:
+        'Send a read receipt for a previously-received message. ' +
+        'Useful before a long thinking/tool-use pause so the sender knows the message was seen, ' +
+        'even before Claude has a full reply.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          message_id: { type: 'string' },
+        },
+        required: ['chat_id', 'message_id'],
       },
     },
   ],
@@ -513,7 +726,7 @@ async function sendChunked(chatId: string, text: string): Promise<number> {
     const params: Record<string, unknown> = { ...recipientParams(chatId), message: c }
     const result = (await rpc('send', params)) as { timestamp?: number }
     lastTs = result?.timestamp ?? Date.now()
-    trackEcho(chatId, c)
+    recordSent(chatId, c, lastTs)
   }
   return lastTs
 }
@@ -540,13 +753,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
           if (args.reply_to) {
             params.quoteTimestamp = Number(args.reply_to)
-            const author = messageAuthors.get(args.reply_to)
+            const author = authorByMessageId(args.reply_to)
             if (author) params.quoteAuthor = author
           }
           if (files.length > 0) params.attachment = files
           const result = (await rpc('send', params)) as { timestamp?: number }
           const ts = result?.timestamp ?? Date.now()
-          trackEcho(chatId, finalText)
+          recordSent(chatId, finalText, ts, files.length > 0 ? files[0] : undefined)
           return { content: [{ type: 'text', text: `sent (${ts})` }] }
         }
 
@@ -563,18 +776,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         const result = (await rpc('send', params)) as { timestamp?: number }
         const ts = result?.timestamp ?? Date.now()
-        trackEcho(chatId, finalText)
+        recordSent(chatId, finalText, ts, undefined, Number(args.message_id))
         return { content: [{ type: 'text', text: `edited (${ts})` }] }
       }
       case 'react': {
         const chatId = args.chat_id as string
         const messageId = args.message_id as string
         const emoji = args.emoji as string
-        const author = messageAuthors.get(messageId)
+        const author = authorByMessageId(messageId)
         if (!author) {
           throw new Error(
-            `cannot react: target author for message_id ${messageId} not in cache. ` +
-            `Reactions only work on messages observed in this session.`,
+            `cannot react: no inbound row for message_id ${messageId}. ` +
+            `Reactions can only target messages this bridge has received.`,
           )
         }
         const params: Record<string, unknown> = {
@@ -596,6 +809,80 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         await rpc('sendTyping', params)
         return { content: [{ type: 'text', text: stop ? 'stopped' : 'typing' }] }
+      }
+      case 'chat_messages': {
+        const where: string[] = []
+        const bindings: (string | number)[] = []
+        if (typeof args.chat_id === 'string' && args.chat_id) {
+          where.push('chat_id = ?')
+          bindings.push(args.chat_id)
+        }
+        const parseArgTs = (v: unknown): number | null => {
+          const s = String(v ?? '').trim()
+          if (!s) return null
+          if (/^\d+$/.test(s)) return Number(s)
+          const p = Date.parse(s)
+          return isNaN(p) ? null : p
+        }
+        const sinceTs = parseArgTs(args.since)
+        if (sinceTs != null) { where.push('ts >= ?'); bindings.push(sinceTs) }
+        const untilTs = parseArgTs(args.until)
+        if (untilTs != null) { where.push('ts <= ?'); bindings.push(untilTs) }
+        if (typeof args.search === 'string' && args.search) {
+          where.push('text LIKE ?')
+          bindings.push(`%${args.search}%`)
+        }
+        const limit = Math.min(Math.max(1, Number(args.limit) || 50), 500)
+        const sql =
+          'SELECT message_id, chat_id, sender_id, text, attachment_path, ts, direction, edited_target FROM messages' +
+          (where.length ? ` WHERE ${where.join(' AND ')}` : '') +
+          ' ORDER BY ts DESC LIMIT ?'
+        bindings.push(limit)
+        const rows = (db.query(sql).all(...bindings) as any[]).map(r => ({
+          message_id: r.message_id,
+          chat_id: r.chat_id,
+          sender_id: r.sender_id,
+          sender_name:
+            r.sender_id === currentAccount
+              ? (authors[r.sender_id]?.display_name ?? 'me')
+              : (authors[r.sender_id]?.display_name ?? r.sender_id),
+          text: r.text,
+          attachment_path: r.attachment_path,
+          ts: new Date(r.ts).toISOString(),
+          direction: r.direction,
+          edited_target: r.edited_target,
+        }))
+        return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] }
+      }
+      case 'list_contacts': {
+        const result = await rpc('listContacts', {})
+        let contacts = (Array.isArray(result) ? result : []) as any[]
+        if (typeof args.match === 'string' && args.match) {
+          const m = args.match.toLowerCase()
+          contacts = contacts.filter(c => {
+            const fields = [
+              c?.name, c?.number, c?.uuid, c?.aci,
+              c?.profileName, c?.profile_given_name, c?.profile_family_name,
+            ]
+            return fields.some(v => typeof v === 'string' && v.toLowerCase().includes(m))
+          })
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(contacts, null, 2) }] }
+      }
+      case 'mark_read': {
+        const messageId = args.message_id as string
+        const sender = authorByMessageId(messageId)
+        if (!sender) {
+          throw new Error(
+            `cannot mark_read: no inbound row for message_id ${messageId}.`,
+          )
+        }
+        await rpc('sendReceipt', {
+          recipient: [sender],
+          type: 'read',
+          targetTimestamp: [Number(messageId)],
+        })
+        return { content: [{ type: 'text', text: `marked read (${messageId})` }] }
       }
       default:
         return {
@@ -638,8 +925,7 @@ mcp.setNotificationHandler(
         ...recipientParams(OWNER),
         message: text,
       })) as { timestamp?: number }
-      trackEcho(OWNER, text)
-      void result
+      recordSent(OWNER, text, result?.timestamp ?? Date.now())
     } catch (err) {
       process.stderr.write(
         `signal channel: permission_request ${request_id} send failed: ${err}\n`,
@@ -669,8 +955,6 @@ function onEnvelope(env: SignalEnvelope) {
   // Echo filter: drop our own outbound looping back as syncMessage.
   if (sent && consumeEcho(chatId, text)) return
 
-  if (senderId) messageAuthors.set(messageId, senderId)
-
   // Permission reply consumer: only honor replies from OWNER, BEFORE the gate.
   if (senderId === OWNER && text) {
     const m = PERMISSION_REPLY_RE.exec(text)
@@ -686,7 +970,9 @@ function onEnvelope(env: SignalEnvelope) {
       // brief ack so the user knows it landed
       const emoji = decision === 'allow' ? '✅' : '❌'
       rpc('send', { ...recipientParams(chatId), message: emoji })
-        .then(() => trackEcho(chatId, emoji))
+        .then(result =>
+          recordSent(chatId, emoji, (result as { timestamp?: number })?.timestamp ?? Date.now()),
+        )
         .catch(err =>
           process.stderr.write(`signal channel: permission ack send failed: ${err}\n`),
         )
@@ -708,12 +994,29 @@ function onEnvelope(env: SignalEnvelope) {
         `${lead} — in your Claude Code terminal, run:\n\n` +
         `/signal:access pair ${result.code}`
       rpc('send', { ...recipientParams(chatId), message })
-        .then(() => trackEcho(chatId, message))
+        .then(result =>
+          recordSent(chatId, message, (result as { timestamp?: number })?.timestamp ?? Date.now()),
+        )
         .catch(err =>
           process.stderr.write(`signal channel: pairing code send failed: ${err}\n`),
         )
       return
     }
+  }
+
+  // Persist before notifying. Only delivered messages land in the cache —
+  // dropped/pre-pairing messages would pollute chat_messages output.
+  if (senderId) {
+    recordReceived(
+      messageId,
+      chatId,
+      senderId,
+      text,
+      env.timestamp,
+      env.sourceName,
+      filePath,
+      env.editMessage?.targetSentTimestamp,
+    )
   }
 
   void mcp.notification({
@@ -757,7 +1060,9 @@ function checkApprovals(): void {
     }
     const message = 'Paired! say hi to claude.'
     rpc('send', { ...recipientParams(chatId), message })
-      .then(() => trackEcho(chatId, message))
+      .then(result =>
+        recordSent(chatId, message, (result as { timestamp?: number })?.timestamp ?? Date.now()),
+      )
       .catch(err =>
         process.stderr.write(`signal channel: approval confirm failed: ${err}\n`),
       )

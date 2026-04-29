@@ -1,7 +1,7 @@
 {
   "name": "signal",
   "description": "Signal channel for Claude Code via signal-cli's JSON-RPC bridge. DMs and groups, attachments, quote-replies, message edits.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "keywords": [
     "signal",
     "signal-cli",

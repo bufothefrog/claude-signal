@@ -62,6 +62,15 @@ the sender is now in `allowFrom` and future messages flow through directly. see 
 | `edit_message` | edit a message the bridge previously sent. `message_id` is the timestamp returned by `reply`. |
 | `react` | add an emoji reaction to a message by id. |
 | `typing` | show or stop a typing indicator in a chat. |
+| `chat_messages` | query persistent message history. filter by `chat_id`, `since`/`until`, `search`, `limit`. |
+| `list_contacts` | list signal-cli contacts. optional `match` substring filter. |
+| `mark_read` | send a read receipt for a previously-received message. |
+
+## history & search
+
+inbound and outbound messages are persisted to `~/.claude/channels/signal/messages.db` (sqlite) as they flow. an author index at `~/.claude/channels/signal/authors.json` tracks display names, first/last seen, and message counts per sender. cross-session `react` works because the bridge looks up the original author from sqlite, not memory.
+
+**install-time limitation:** messages from before v0.3 install are not in the cache. signal-cli has no `listMessages` command, so historical bootstrap isn't possible — capture is reactive from the moment the upgraded bridge starts.
 
 ## permission relay
 
