@@ -34,15 +34,17 @@ if exactly one signal-cli account is linked, the bridge auto-detects it. if mult
 /signal:configure account +15551234567
 ```
 
+run `/signal:configure` with no arguments to see all toggles and their current values, or copy [`.env.example`](./.env.example) to `~/.claude/channels/signal/.env` for an annotated reference of every setting.
+
 ## profile name
 
-freshly registered signal-cli accounts have no profile, so messages from them show up as "unknown contact" until profile keys are exchanged. on first boot the bridge sets the profile name to `OpenClaw` for you. override the name via env or `.env`:
+freshly registered signal-cli accounts have no profile, so messages from them show up as "unknown contact" until profile keys are exchanged. on first boot the bridge sets the profile name to `OpenClaw` for you. change it via:
 
 ```
-SIGNAL_PROFILE_NAME=Claude
+/signal:configure profile-name Claude
 ```
 
-set it to empty to disable. the bridge writes a marker file at `~/.claude/channels/signal/.profile-set` and only re-applies if the configured name changes — your signal profile won't be silently overwritten. delete the marker if you ever need to force a re-set.
+or directly in `~/.claude/channels/signal/.env` as `SIGNAL_PROFILE_NAME=Claude`. set the env var to empty to disable. the bridge writes a marker file at `~/.claude/channels/signal/.profile-set` and only re-applies if the configured name changes — your signal profile won't be silently overwritten. delete the marker if you ever need to force a re-set.
 
 ## access control
 
@@ -78,10 +80,10 @@ inbound and outbound messages are persisted to `~/.claude/channels/signal/messag
 by default, a sender doesn't know the bridge saw their message until claude calls `mark_read` (or sends a reply). flip this with:
 
 ```
-SIGNAL_AUTO_READ_RECEIPTS=true
+/signal:configure auto-receipts on
 ```
 
-every inbound message gets an automatic read receipt as it lands, before claude has even responded. own-account syncMessages and message edits are skipped. think of it as a presence signal — useful for chats where "seen but not yet replied" is friendlier than radio silence, but a privacy regression for chats where you want claude to choose what to acknowledge.
+(or directly: `SIGNAL_AUTO_READ_RECEIPTS=true` in `.env`.) every inbound message gets an automatic read receipt as it lands, before claude has even responded. own-account syncMessages and message edits are skipped. think of it as a presence signal — useful for chats where "seen but not yet replied" is friendlier than radio silence, but a privacy regression for chats where you want claude to choose what to acknowledge.
 
 ## permission relay
 
@@ -98,7 +100,7 @@ owner defaults to the linked account. override with:
 the plugin itself is a Claude Code MCP server — it lives and dies with your Claude Code session. keeping the session up between machines is OS-specific, so the plugin doesn't pick a winner. some lightweight options:
 
 - **tmux / screen / zellij** — simplest cross-platform answer. start `claude` in a detached tmux session; reattach when you want to read along.
-- **nohup + log** — `nohup claude --dangerously-load-development-channels plugin:signal@local > ~/claude.log 2>&1 &`.
+- **nohup + log** — `nohup claude --channels plugin:signal@<your-marketplace> > ~/claude.log 2>&1 &`.
 - **macOS launchd** — write a per-user `LaunchAgent` plist; `launchctl load` it.
 - **Linux systemd** — community-contributed example unit at [`contrib/systemd/claude-signal.service`](./contrib/systemd/claude-signal.service); see comments inside for `loginctl enable-linger` if you want it to run without an active login.
 - **Windows** — Task Scheduler with "run whether user is logged on or not", or a wrapper service via NSSM.
