@@ -64,6 +64,7 @@ the sender is now in `allowFrom` and future messages flow through directly. see 
 | `typing` | show or stop a typing indicator in a chat. |
 | `chat_messages` | query persistent message history. filter by `chat_id`, `since`/`until`, `search`, `limit`. |
 | `list_contacts` | list signal-cli contacts. optional `match` substring filter. |
+| `list_groups` | list signal groups the bridge belongs to. optional `match` filter on title/id/description. |
 | `mark_read` | send a read receipt for a previously-received message. |
 
 ## history & search
@@ -71,6 +72,16 @@ the sender is now in `allowFrom` and future messages flow through directly. see 
 inbound and outbound messages are persisted to `~/.claude/channels/signal/messages.db` (sqlite) as they flow. an author index at `~/.claude/channels/signal/authors.json` tracks display names, first/last seen, and message counts per sender. cross-session `react` works because the bridge looks up the original author from sqlite, not memory.
 
 **install-time limitation:** messages from before v0.3 install are not in the cache. signal-cli has no `listMessages` command, so historical bootstrap isn't possible — capture is reactive from the moment the upgraded bridge starts.
+
+## auto read-receipts (optional)
+
+by default, a sender doesn't know the bridge saw their message until claude calls `mark_read` (or sends a reply). flip this with:
+
+```
+SIGNAL_AUTO_READ_RECEIPTS=true
+```
+
+every inbound message gets an automatic read receipt as it lands, before claude has even responded. own-account syncMessages and message edits are skipped. think of it as a presence signal — useful for chats where "seen but not yet replied" is friendlier than radio silence, but a privacy regression for chats where you want claude to choose what to acknowledge.
 
 ## permission relay
 
@@ -82,16 +93,17 @@ owner defaults to the linked account. override with:
 /signal:configure owner +15551234567
 ```
 
-## running 24/7
+## running long-lived
 
-a systemd user unit lives at `contrib/systemd/claude-signal.service`. to install:
+the plugin itself is a Claude Code MCP server — it lives and dies with your Claude Code session. keeping the session up between machines is OS-specific, so the plugin doesn't pick a winner. some lightweight options:
 
-```sh
-loginctl enable-linger <user>
-systemctl --user enable --now claude-signal
-```
+- **tmux / screen / zellij** — simplest cross-platform answer. start `claude` in a detached tmux session; reattach when you want to read along.
+- **nohup + log** — `nohup claude --dangerously-load-development-channels plugin:signal@local > ~/claude.log 2>&1 &`.
+- **macOS launchd** — write a per-user `LaunchAgent` plist; `launchctl load` it.
+- **Linux systemd** — community-contributed example unit at [`contrib/systemd/claude-signal.service`](./contrib/systemd/claude-signal.service); see comments inside for `loginctl enable-linger` if you want it to run without an active login.
+- **Windows** — Task Scheduler with "run whether user is logged on or not", or a wrapper service via NSSM.
 
-`enable-linger` lets the service run without an active login session.
+contributions of additional service-manager examples to `contrib/` are welcome.
 
 ## troubleshooting
 

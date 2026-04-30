@@ -93,6 +93,8 @@ const SIGNAL_CONFIG =
   process.env.SIGNAL_CLI_CONFIG ??
   envFile.SIGNAL_CLI_CONFIG ??
   join(homedir(), '.local', 'share', 'signal-cli')
+const AUTO_READ_RECEIPTS =
+  (process.env.SIGNAL_AUTO_READ_RECEIPTS ?? envFile.SIGNAL_AUTO_READ_RECEIPTS) === 'true'
 
 // Resolved at startup, before mcp.connect, after listAccounts.
 let currentAccount = ''
@@ -647,6 +649,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'list_groups',
+      description:
+        'List Signal groups the bridge account is a member of. Returns id, title, description, members, ' +
+        'active and blocked status. Optional match filters by case-insensitive substring on title/id/description. ' +
+        'Useful for finding the chat_id (group:<base64>) of a group you have not yet seen messages from.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          match: { type: 'string' },
+        },
+      },
+    },
+    {
       name: 'mark_read',
       description:
         'Send a read receipt for a previously-received message. ' +
@@ -869,6 +884,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         return { content: [{ type: 'text', text: JSON.stringify(contacts, null, 2) }] }
       }
+      case 'list_groups': {
+        const result = await rpc('listGroups', {})
+        let groups = (Array.isArray(result) ? result : []) as any[]
+        if (typeof args.match === 'string' && args.match) {
+          const m = args.match.toLowerCase()
+          groups = groups.filter(g => {
+            const fields = [g?.id, g?.title, g?.name, g?.description]
+            return fields.some(v => typeof v === 'string' && v.toLowerCase().includes(m))
+          })
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(groups, null, 2) }] }
+      }
       case 'mark_read': {
         const messageId = args.message_id as string
         const sender = authorByMessageId(messageId)
@@ -1020,6 +1047,22 @@ function onEnvelope(env: SignalEnvelope) {
       filePath,
       env.editMessage?.targetSentTimestamp,
     )
+
+    // Auto-read-receipts: skip our own outbound (syncMessage) and edits (the
+    // edited target was already acked when first seen).
+    if (
+      AUTO_READ_RECEIPTS &&
+      senderId !== currentAccount &&
+      !env.editMessage
+    ) {
+      rpc('sendReceipt', {
+        recipient: senderId,
+        type: 'read',
+        targetTimestamp: [env.timestamp],
+      }).catch(err =>
+        process.stderr.write(`signal channel: auto-receipt failed: ${err}\n`),
+      )
+    }
   }
 
   void mcp.notification({
@@ -1130,7 +1173,13 @@ function spawnSignalCli(): void {
       if (typeof msg.id === 'number' && pending.has(msg.id)) {
         const p = pending.get(msg.id)!
         pending.delete(msg.id)
-        if (msg.error) p.reject(new Error(msg.error.message ?? JSON.stringify(msg.error)))
+        if (msg.error) {
+          const head = msg.error.message ?? `code ${msg.error.code}`
+          const data = msg.error.data
+          const tail = data === undefined ? '' :
+            ` — ${typeof data === 'string' ? data : JSON.stringify(data)}`
+          p.reject(new Error(`${head}${tail}`))
+        }
         else p.resolve(msg.result)
       } else if (msg.method === 'receive' && msg.params?.envelope) {
         try {
