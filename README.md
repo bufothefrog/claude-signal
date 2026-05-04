@@ -38,13 +38,13 @@ run `/signal:configure` with no arguments to see all toggles and their current v
 
 ## profile name
 
-freshly registered signal-cli accounts have no profile, so messages from them show up as "unknown contact" until profile keys are exchanged. on first boot the bridge sets the profile name to `OpenClaw` for you. change it via:
+freshly registered signal-cli accounts have no profile, so messages from them show up as "unknown contact" until profile keys are exchanged. set a display name via `SIGNAL_PROFILE_NAME` and the bridge will apply it on first boot:
 
 ```
-/signal:configure profile-name Claude
+/signal:configure profile-name <your-name>
 ```
 
-or directly in `~/.claude/channels/signal/.env` as `SIGNAL_PROFILE_NAME=Claude`. set the env var to empty to disable. the bridge writes a marker file at `~/.claude/channels/signal/.profile-set` and only re-applies if the configured name changes — your signal profile won't be silently overwritten. delete the marker if you ever need to force a re-set.
+or directly in `~/.claude/channels/signal/.env` as `SIGNAL_PROFILE_NAME=<your-name>`. default is empty (no auto-set) — the bridge leaves your signal profile untouched until you opt in. the bridge writes a marker file at `~/.claude/channels/signal/.profile-set` and only re-applies if the configured name changes — your signal profile won't be silently overwritten on subsequent boots. delete the marker if you ever need to force a re-set.
 
 ## access control
 

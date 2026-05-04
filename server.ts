@@ -1992,7 +1992,7 @@ spawnSignalCli()
 // re-set if it differs (e.g. user changed SIGNAL_PROFILE_NAME). Empty value
 // disables. Fire-and-forget; never blocks startup, never fatal on failure.
 let PROFILE_NAME =
-  process.env.SIGNAL_PROFILE_NAME ?? envFile.SIGNAL_PROFILE_NAME ?? 'OpenClaw'
+  process.env.SIGNAL_PROFILE_NAME ?? envFile.SIGNAL_PROFILE_NAME ?? ''
 
 if (PROFILE_NAME) {
   ;(async () => {

@@ -35,14 +35,14 @@ build a single multi-section plain-text report. don't dump JSON; format it for s
 
 surface the four behavior toggles so the user can see what's on/off without opening `.env`.
 
-1. **profile name**: resolve `process.env.SIGNAL_PROFILE_NAME` > `.env`'s `SIGNAL_PROFILE_NAME` > default `OpenClaw`. show the resolved value (or `(disabled — empty)` if explicitly set to empty), label the source.
+1. **profile name**: resolve `process.env.SIGNAL_PROFILE_NAME` > `.env`'s `SIGNAL_PROFILE_NAME` > default empty (no auto-set). show the resolved value (or `(disabled — empty)` if empty), label the source.
 2. **auto read-receipts**: resolve `process.env.SIGNAL_AUTO_READ_RECEIPTS` > `.env`'s `SIGNAL_AUTO_READ_RECEIPTS` > unset. interpret as **on** if the literal lowercase value is `true`, otherwise **off**. label the source.
 3. **append signature**: same precedence + same `=== 'true'` semantics for `SIGNAL_APPEND_SIGNATURE`.
 4. **access mode**: resolve `process.env.SIGNAL_ACCESS_MODE` > `.env`'s `SIGNAL_ACCESS_MODE` > unset. show `static (frozen)` if the value is `static`, otherwise `dynamic` (default). label the source.
 
 format each as a single line, e.g.:
 ```
-profile name:        OpenClaw           (default)
+profile name:        (disabled — empty) (default)
 auto read-receipts:  off                (default)
 append signature:    on                 (.env)
 access mode:         dynamic            (default)

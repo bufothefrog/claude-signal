@@ -26,7 +26,7 @@ SIGNAL_ACCOUNT=+15551234567           # optional; auto-detect if exactly one lin
 SIGNAL_OWNER=+15551234567             # owner for permission relay; defaults to SIGNAL_ACCOUNT
 SIGNAL_CLI_PATH=/path/to/signal-cli   # optional
 SIGNAL_CLI_CONFIG=/path/to/data       # optional
-SIGNAL_PROFILE_NAME=OpenClaw          # profile name shown to recipients; default OpenClaw, set empty to disable
+SIGNAL_PROFILE_NAME=                  # profile name shown to recipients; empty by default (no auto-set)
 SIGNAL_AUTO_READ_RECEIPTS=false       # auto-ack inbound messages without waiting for Claude's reply
 SIGNAL_APPEND_SIGNATURE=false         # append a "via Claude" footer to outbound replies
 SIGNAL_ACCESS_MODE=                   # set to "static" to freeze access.json into read-only (deploy mode)
@@ -95,7 +95,7 @@ same shape as `auto-receipts` but writes `SIGNAL_APPEND_SIGNATURE=`.
 
 ### `profile-name <name>`
 
-set `SIGNAL_PROFILE_NAME` — the display name your bridge account shows to other Signal users. default is `OpenClaw`. takes effect on next session restart, and only re-applies to your Signal profile if the new name differs from what was last set (the bridge writes a marker file at `~/.claude/channels/signal/.profile-set` to track this).
+set `SIGNAL_PROFILE_NAME` — the display name your bridge account shows to other Signal users. empty by default (the bridge does not auto-set a profile name unless you opt in). takes effect on next session restart, and only re-applies to your Signal profile if the new name differs from what was last set (the bridge writes a marker file at `~/.claude/channels/signal/.profile-set` to track this).
 
 1. accept any non-empty string. names with spaces are fine.
 2. mkdir -p, read existing `.env`, update or insert `SIGNAL_PROFILE_NAME=<value>`, preserve other lines.
@@ -104,7 +104,7 @@ set `SIGNAL_PROFILE_NAME` — the display name your bridge account shows to othe
 
 ### `profile-name clear`
 
-remove `SIGNAL_PROFILE_NAME` from `.env`. the runtime then falls back to the default `OpenClaw`. preserves all other lines. atomic write.
+remove `SIGNAL_PROFILE_NAME` from `.env`. the runtime then falls back to the empty default (no auto-set). preserves all other lines. atomic write. note: this does NOT reset your existing Signal profile — it just stops the bridge from re-applying on subsequent boots. to clear your actual Signal profile name, call `update_profile` with `given_name=""` from a Claude Code session.
 
 ### `link`
 
