@@ -103,6 +103,7 @@ let OWNER = ''
 // --- access state ------------------------------------------------------------
 
 type PendingEntry = {
+  kind: 'dm' | 'group'
   senderId: string
   chatId: string
   createdAt: number
@@ -117,6 +118,7 @@ type GroupPolicy = {
 
 type Access = {
   dmPolicy: 'pairing' | 'allowlist' | 'disabled'
+  groupPolicy: 'pairing' | 'allowlist' | 'disabled'
   allowFrom: string[]
   groups: Record<string, GroupPolicy>
   pending: Record<string, PendingEntry>
@@ -126,18 +128,29 @@ type Access = {
 }
 
 function defaultAccess(): Access {
-  return { dmPolicy: 'pairing', allowFrom: [], groups: {}, pending: {} }
+  return {
+    dmPolicy: 'pairing',
+    groupPolicy: 'pairing',
+    allowFrom: [],
+    groups: {},
+    pending: {},
+  }
 }
 
 function readAccessFile(): Access {
   try {
     const raw = readFileSync(ACCESS_FILE, 'utf8')
     const parsed = JSON.parse(raw) as Partial<Access>
+    const pending: Record<string, PendingEntry> = {}
+    for (const [code, entry] of Object.entries(parsed.pending ?? {})) {
+      pending[code] = { kind: 'dm', ...(entry as PendingEntry) }
+    }
     return {
       dmPolicy: parsed.dmPolicy ?? 'pairing',
+      groupPolicy: parsed.groupPolicy ?? 'pairing',
       allowFrom: parsed.allowFrom ?? [],
       groups: parsed.groups ?? {},
-      pending: parsed.pending ?? {},
+      pending,
       mentionPatterns: parsed.mentionPatterns,
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
@@ -160,6 +173,12 @@ const BOOT_ACCESS: Access | null = STATIC
           'signal channel: static mode — dmPolicy "pairing" downgraded to "allowlist"\n',
         )
         a.dmPolicy = 'allowlist'
+      }
+      if (a.groupPolicy === 'pairing') {
+        process.stderr.write(
+          'signal channel: static mode — groupPolicy "pairing" downgraded to "allowlist"\n',
+        )
+        a.groupPolicy = 'allowlist'
       }
       a.pending = {}
       return a
@@ -192,31 +211,34 @@ function pruneExpired(a: Access): boolean {
 
 // --- gate --------------------------------------------------------------------
 
+type SignalMention = { uuid?: string; number?: string; name?: string; start?: number; length?: number }
+
 type GateInput = {
   senderId: string
   chatId: string
   isGroup: boolean
   text: string
+  mentions?: SignalMention[]
 }
 
 type GateResult =
   | { action: 'deliver' }
   | { action: 'drop' }
   | { action: 'pair'; code: string; isResend: boolean }
+  | { action: 'group_pair'; code: string; isResend: boolean }
 
 function gate(input: GateInput): GateResult {
   const access = loadAccess()
   const pruned = pruneExpired(access)
   if (pruned) saveAccess(access)
 
-  if (access.dmPolicy === 'disabled') return { action: 'drop' }
-
   if (!input.isGroup) {
+    if (access.dmPolicy === 'disabled') return { action: 'drop' }
     if (access.allowFrom.includes(input.senderId)) return { action: 'deliver' }
     if (access.dmPolicy === 'allowlist') return { action: 'drop' }
 
     for (const [code, p] of Object.entries(access.pending)) {
-      if (p.senderId === input.senderId) {
+      if (p.kind === 'dm' && p.senderId === input.senderId) {
         if ((p.replies ?? 1) >= 2) return { action: 'drop' }
         p.replies = (p.replies ?? 1) + 1
         saveAccess(access)
@@ -228,6 +250,7 @@ function gate(input: GateInput): GateResult {
     const code = randomBytes(3).toString('hex')
     const now = Date.now()
     access.pending[code] = {
+      kind: 'dm',
       senderId: input.senderId,
       chatId: input.chatId,
       createdAt: now,
@@ -238,21 +261,64 @@ function gate(input: GateInput): GateResult {
     return { action: 'pair', code, isResend: false }
   }
 
+  // group
+  if (access.groupPolicy === 'disabled') return { action: 'drop' }
   const policy = access.groups[input.chatId]
-  if (!policy) return { action: 'drop' }
-  const groupAllowFrom = policy.allowFrom ?? []
-  const requireMention = policy.requireMention ?? true
-  if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(input.senderId)) {
-    return { action: 'drop' }
+  if (policy) {
+    const groupAllowFrom = policy.allowFrom ?? []
+    const requireMention = policy.requireMention ?? true
+    if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(input.senderId)) {
+      return { action: 'drop' }
+    }
+    if (requireMention && !isMentioned(input.text, access.mentionPatterns, input.mentions)) {
+      return { action: 'drop' }
+    }
+    return { action: 'deliver' }
   }
-  if (requireMention && !isMentioned(input.text, access.mentionPatterns)) {
-    return { action: 'drop' }
+  // unknown group
+  if (access.groupPolicy === 'allowlist') return { action: 'drop' }
+  // groupPolicy === 'pairing': dedupe by chatId, prompt owner once.
+  for (const p of Object.values(access.pending)) {
+    if (p.kind === 'group' && p.chatId === input.chatId) return { action: 'drop' }
   }
-  return { action: 'deliver' }
+  if (Object.keys(access.pending).length >= 3) return { action: 'drop' }
+
+  const code = randomBytes(3).toString('hex')
+  const now = Date.now()
+  access.pending[code] = {
+    kind: 'group',
+    senderId: input.senderId,
+    chatId: input.chatId,
+    createdAt: now,
+    expiresAt: now + 60 * 60 * 1000,
+    replies: 1,
+  }
+  saveAccess(access)
+  return { action: 'group_pair', code, isResend: false }
 }
 
-function isMentioned(text: string, patterns?: string[]): boolean {
-  for (const pat of patterns ?? []) {
+function escapeRegex(s: string): string {
+  return s.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&')
+}
+
+function isMentioned(
+  text: string,
+  patterns: string[] | undefined,
+  mentions: SignalMention[] | undefined,
+): boolean {
+  // Structured Signal @-mention: signal-cli renders the @-mention as a single
+  // U+FFFC object-replacement char in `text` and surfaces the actual identity
+  // in `data.mentions` (each entry has uuid/number/start/length). If the
+  // bridge's own account is in there, the user tapped @ and picked us.
+  if (mentions?.some(m => m.number === currentAccount || m.uuid === currentAccount)) {
+    return true
+  }
+  // Text-pattern fallback: explicit `mentionPatterns` from access.json plus
+  // an implicit @<PROFILE_NAME> derived from runtime profile state. Useful for
+  // users who type literal `@bot` triggers or for non-Signal-mention prefixes.
+  const all = [...(patterns ?? [])]
+  if (PROFILE_NAME) all.push(`@${escapeRegex(PROFILE_NAME)}`)
+  for (const pat of all) {
     try {
       if (new RegExp(pat, 'i').test(text)) return true
     } catch {}
@@ -478,7 +544,23 @@ function authorByMessageId(messageId: string): string | undefined {
 type SignalDataMessage = {
   message?: string
   attachments?: Array<{ id: string; filename?: string; contentType?: string }>
-  groupInfo?: { groupId: string }
+  groupInfo?: {
+    groupId: string
+    groupName?: string
+    type?: string  // UPDATE | DELIVER | QUIT | REQUEST_INFO
+    revision?: number
+  }
+  reaction?: {
+    emoji: string
+    // signal-cli v0.14.x emits targetAuthor as a flat recipient identifier string
+    // (verified empirically 2026-05-01). Older notes had this as {uuid, number};
+    // the *Uuid / *Number siblings carry the same data more reliably.
+    targetAuthor?: string
+    targetAuthorUuid?: string
+    targetAuthorNumber?: string
+    targetSentTimestamp: number
+    isRemove?: boolean
+  }
 }
 
 type SignalEnvelope = {
@@ -499,6 +581,14 @@ type SignalEnvelope = {
       destinationNumber?: string
       timestamp?: number
     }
+    contacts?: unknown  // non-null when linked devices push a contacts-sync blob
+  }
+  receiptMessage?: {
+    when: number
+    isDelivery: boolean
+    isRead: boolean
+    isViewed: boolean
+    timestamps: number[]
   }
 }
 
@@ -524,6 +614,15 @@ function recipientParams(chatId: string): Record<string, unknown> {
   return { recipient: [chatId] }
 }
 
+// Sibling to recipientParams. Some signal-cli commands (trust, updateContact,
+// removeContact, getAttachment) take a single-string recipient instead of
+// the array `send` uses. Same routing logic, different shape.
+function singleRecipientParams(chatId: string): Record<string, unknown> {
+  if (chatId.startsWith('group:')) return { groupId: chatId.slice(6) }
+  if (/^[a-z][a-z0-9_]{2,31}\.\d{2,}$/.test(chatId)) return { username: chatId }
+  return { recipient: chatId }
+}
+
 // --- mcp ---------------------------------------------------------------------
 
 const mcp = new Server(
@@ -532,9 +631,14 @@ const mcp = new Server(
     capabilities: {
       tools: {},
       experimental: {
+        // The Claude Code host only surfaces notifications via the canonical
+        // `notifications/claude/channel` method. Sub-method routing (e.g.
+        // `.../channel/receipt`) is filtered even with the matching
+        // capability declared — only `claude/channel/permission` is special-
+        // cased. For other event types (receipts, reactions, group updates,
+        // contact updates), use the canonical method with a meta.event_type
+        // discriminator instead.
         'claude/channel': {},
-        // Permission-relay opt-in. We authenticate the replier: prompts go
-        // to OWNER's chat only, replies are accepted from OWNER only.
         'claude/channel/permission': {},
       },
     },
@@ -674,6 +778,226 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           message_id: { type: 'string' },
         },
         required: ['chat_id', 'message_id'],
+      },
+    },
+    {
+      name: 'list_identities',
+      description:
+        'List identity records the bridge knows about. Each entry has number, uuid, fingerprint, ' +
+        'safetyNumber, scannableSafetyNumber, trustLevel (TRUSTED_UNVERIFIED|TRUSTED_VERIFIED|UNTRUSTED), ' +
+        'and addedTimestamp. Optional number filter scopes results to a specific phone. ' +
+        'Useful when an outbound send fails with UntrustedIdentity — inspect the new safety number before deciding whether to trust.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          number: { type: 'string' },
+        },
+      },
+    },
+    {
+      name: 'trust',
+      description:
+        'Trust a contact identity after their safety number changes (e.g. they got a new phone). ' +
+        'Required: chat_id. Provide either trust_all_known_keys=true (convenient: trust whatever they have now) ' +
+        'or safety_number (rigorous: trust only this exact safety number). ' +
+        'After trust, sends to that contact succeed again. Throws if SIGNAL_ACCESS_MODE=static.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          trust_all_known_keys: { type: 'boolean' },
+          safety_number: { type: 'string' },
+        },
+        required: ['chat_id'],
+      },
+    },
+    {
+      name: 'block',
+      description:
+        'Block a contact or group. Once blocked, the bridge no longer receives messages from them. ' +
+        'Required: chat_id (UUID/phone for a contact, group:<base64> for a group). ' +
+        'Reverse with the unblock tool. Throws if SIGNAL_ACCESS_MODE=static.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+        },
+        required: ['chat_id'],
+      },
+    },
+    {
+      name: 'unblock',
+      description:
+        'Unblock a previously-blocked contact or group. Required: chat_id. Throws if SIGNAL_ACCESS_MODE=static.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+        },
+        required: ['chat_id'],
+      },
+    },
+    {
+      name: 'get_user_status',
+      description:
+        'Check whether a phone number, UUID, or username is registered on Signal. ' +
+        'Useful for validating chat_id before a reply errors out with an opaque "unknown recipient". ' +
+        'Required: chat_id (must be a contact, not a group). Returns the resolved record. Read-only.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+        },
+        required: ['chat_id'],
+      },
+    },
+    {
+      name: 'remote_delete',
+      description:
+        'Delete a previously-sent message on the recipient\'s side. "Oops" recovery for a bad outbound. ' +
+        'Required: chat_id (where the message went) and target_timestamp (the timestamp returned by reply, ' +
+        'also the message_id field in chat_messages output for direction=out rows). ' +
+        'Throws if SIGNAL_ACCESS_MODE=static.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          target_timestamp: { type: 'number' },
+        },
+        required: ['chat_id', 'target_timestamp'],
+      },
+    },
+    {
+      name: 'update_profile',
+      description:
+        'Update fields on the bridge account\'s own Signal profile. All fields optional; supply only what you want to change. ' +
+        'avatar and remove_avatar are mutually exclusive. Throws if SIGNAL_ACCESS_MODE=static.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          given_name: { type: 'string' },
+          family_name: { type: 'string' },
+          about: { type: 'string' },
+          about_emoji: { type: 'string' },
+          mobile_coin_address: { type: 'string' },
+          avatar: { type: 'string', description: 'Path to a local image file to use as the new avatar.' },
+          remove_avatar: { type: 'boolean' },
+        },
+      },
+    },
+    {
+      name: 'update_contact',
+      description:
+        'Update local-only contact fields for a Signal contact (nickname, note, disappearing-message expiration). ' +
+        'Required: chat_id (UUID/phone/username — must be a contact, not a group). ' +
+        'expiration is in seconds; 0 disables disappearing messages. ' +
+        'These changes are local to this account and do not propagate to the contact. Throws if SIGNAL_ACCESS_MODE=static.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          given_name: { type: 'string' },
+          family_name: { type: 'string' },
+          nick_given_name: { type: 'string' },
+          nick_family_name: { type: 'string' },
+          note: { type: 'string' },
+          expiration: { type: 'number', description: 'Disappearing-message expiration in seconds. 0 disables.' },
+        },
+        required: ['chat_id'],
+      },
+    },
+    {
+      name: 'remove_contact',
+      description:
+        'Remove a Signal contact. Required: chat_id (UUID/phone/username). ' +
+        'hide and forget are mutually exclusive: hide keeps history but removes from contact list (reversible by re-adding); ' +
+        'forget wipes all local data including identity keys (irreversible without re-pairing). ' +
+        'Default behavior (neither flag) just clears profile/contact info. Throws if SIGNAL_ACCESS_MODE=static.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          hide: { type: 'boolean' },
+          forget: { type: 'boolean' },
+        },
+        required: ['chat_id'],
+      },
+    },
+    {
+      name: 'join_group',
+      description:
+        'Join a Signal group via an invite link. Required: uri (the signal.group/#... URL). ' +
+        'Returns the new groupId for use with list_groups, reply, update_group, quit_group. Throws if SIGNAL_ACCESS_MODE=static.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          uri: { type: 'string' },
+        },
+        required: ['uri'],
+      },
+    },
+    {
+      name: 'quit_group',
+      description:
+        'Leave a Signal group. Required: group_id (base64 from list_groups, no "group:" prefix needed but accepted). ' +
+        'Optional delete=true also removes local group state. ' +
+        'Optional admins (array of UUIDs/phones) transfers admin to those members if the bridge is the last admin. ' +
+        'Throws if SIGNAL_ACCESS_MODE=static.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          group_id: { type: 'string' },
+          delete: { type: 'boolean' },
+          admins: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['group_id'],
+      },
+    },
+    {
+      name: 'get_attachment',
+      description:
+        'Re-fetch an attachment from Signal\'s servers and write it to the bridge\'s canonical attachments path ' +
+        '(<config>/attachments/<id>, the same path channel events use). signal-cli garbage-collects attachments after a ' +
+        'window; use this when an inbound channel event\'s file_path no longer resolves. ' +
+        'Required: attachment_id (the id from a previous channel event\'s file_path or message_id). ' +
+        'Required: chat_id (the conversation the attachment came from — UUID/phone/username for DM, group:<base64> for group). Read-only.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          attachment_id: { type: 'string' },
+          chat_id: { type: 'string' },
+        },
+        required: ['attachment_id', 'chat_id'],
+      },
+    },
+    {
+      name: 'update_group',
+      description:
+        'Update fields on a Signal group. Required: group_id. All other fields optional; supply only what you want to change. ' +
+        'Identity: name, description, avatar (file path), expiration (seconds; 0 disables disappearing). ' +
+        'Membership: members/remove_members/admins/remove_admins/banned/unbanned (arrays of UUIDs/phones/usernames). ' +
+        'Permissions: link (enabled|enabled-with-approval|disabled), permission_add_member / permission_edit_details / permission_send_messages (every-member|only-admins). ' +
+        'Throws if SIGNAL_ACCESS_MODE=static.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          group_id: { type: 'string' },
+          name: { type: 'string' },
+          description: { type: 'string' },
+          avatar: { type: 'string' },
+          expiration: { type: 'number' },
+          members: { type: 'array', items: { type: 'string' } },
+          remove_members: { type: 'array', items: { type: 'string' } },
+          admins: { type: 'array', items: { type: 'string' } },
+          remove_admins: { type: 'array', items: { type: 'string' } },
+          banned: { type: 'array', items: { type: 'string' } },
+          unbanned: { type: 'array', items: { type: 'string' } },
+          link: { type: 'string', enum: ['enabled', 'enabled-with-approval', 'disabled'] },
+          permission_add_member: { type: 'string', enum: ['every-member', 'only-admins'] },
+          permission_edit_details: { type: 'string', enum: ['every-member', 'only-admins'] },
+          permission_send_messages: { type: 'string', enum: ['every-member', 'only-admins'] },
+        },
+        required: ['group_id'],
       },
     },
   ],
@@ -914,6 +1238,181 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         })
         return { content: [{ type: 'text', text: `marked read (${messageId})` }] }
       }
+      case 'list_identities': {
+        const params: Record<string, unknown> = {}
+        if (typeof args.number === 'string' && args.number) params.number = args.number
+        const result = await rpc('listIdentities', params)
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+      }
+      case 'trust': {
+        if (STATIC) throw new Error('trust blocked: SIGNAL_ACCESS_MODE=static')
+        const chatId = args.chat_id as string
+        const params: Record<string, unknown> = { ...singleRecipientParams(chatId) }
+        if (args.trust_all_known_keys === true) params.trustAllKnownKeys = true
+        else if (typeof args.safety_number === 'string' && args.safety_number) {
+          params.verifiedSafetyNumber = args.safety_number
+        }
+        else throw new Error('trust requires either trust_all_known_keys=true or safety_number')
+        await rpc('trust', params)
+        return { content: [{ type: 'text', text: `trusted ${chatId}` }] }
+      }
+      case 'block': {
+        if (STATIC) throw new Error('block blocked: SIGNAL_ACCESS_MODE=static')
+        const chatId = args.chat_id as string
+        const params: Record<string, unknown> = chatId.startsWith('group:')
+          ? { groupId: [chatId.slice(6)] }
+          : { recipient: [chatId] }
+        await rpc('block', params)
+        return { content: [{ type: 'text', text: `blocked ${chatId}` }] }
+      }
+      case 'unblock': {
+        if (STATIC) throw new Error('unblock blocked: SIGNAL_ACCESS_MODE=static')
+        const chatId = args.chat_id as string
+        const params: Record<string, unknown> = chatId.startsWith('group:')
+          ? { groupId: [chatId.slice(6)] }
+          : { recipient: [chatId] }
+        await rpc('unblock', params)
+        return { content: [{ type: 'text', text: `unblocked ${chatId}` }] }
+      }
+      case 'get_user_status': {
+        const chatId = args.chat_id as string
+        if (chatId.startsWith('group:')) {
+          throw new Error('get_user_status: chat_id must be a contact, not a group')
+        }
+        const params: Record<string, unknown> =
+          /^[a-z][a-z0-9_]{2,31}\.\d{2,}$/.test(chatId)
+            ? { username: [chatId] }
+            : { recipient: [chatId] }
+        const result = await rpc('getUserStatus', params)
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+      }
+      case 'remote_delete': {
+        if (STATIC) throw new Error('remote_delete blocked: SIGNAL_ACCESS_MODE=static')
+        const chatId = args.chat_id as string
+        const targetTimestamp = Number(args.target_timestamp)
+        if (!Number.isFinite(targetTimestamp)) {
+          throw new Error('remote_delete: target_timestamp must be a number')
+        }
+        const recipParams: Record<string, unknown> = chatId.startsWith('group:')
+          ? { groupId: [chatId.slice(6)] }
+          : /^[a-z][a-z0-9_]{2,31}\.\d{2,}$/.test(chatId)
+            ? { username: [chatId] }
+            : { recipient: [chatId] }
+        await rpc('remoteDelete', { ...recipParams, targetTimestamp })
+        return { content: [{ type: 'text', text: `remote-deleted ${targetTimestamp} in ${chatId}` }] }
+      }
+      case 'update_profile': {
+        if (STATIC) throw new Error('update_profile blocked: SIGNAL_ACCESS_MODE=static')
+        const params: Record<string, unknown> = {}
+        if (typeof args.given_name === 'string') params.givenName = args.given_name
+        if (typeof args.family_name === 'string') params.familyName = args.family_name
+        if (typeof args.about === 'string') params.about = args.about
+        if (typeof args.about_emoji === 'string') params.aboutEmoji = args.about_emoji
+        if (typeof args.mobile_coin_address === 'string') params.mobileCoinAddress = args.mobile_coin_address
+        const hasAvatar = typeof args.avatar === 'string' && args.avatar
+        const removeAvatar = args.remove_avatar === true
+        if (hasAvatar && removeAvatar) {
+          throw new Error('update_profile: avatar and remove_avatar are mutually exclusive')
+        }
+        if (hasAvatar) params.avatar = args.avatar
+        if (removeAvatar) params.removeAvatar = true
+        if (Object.keys(params).length === 0) {
+          throw new Error('update_profile: provide at least one field to update')
+        }
+        await rpc('updateProfile', params)
+        if (typeof args.given_name === 'string') PROFILE_NAME = args.given_name
+        return { content: [{ type: 'text', text: `profile updated (${Object.keys(params).join(', ')})` }] }
+      }
+      case 'update_contact': {
+        if (STATIC) throw new Error('update_contact blocked: SIGNAL_ACCESS_MODE=static')
+        const chatId = args.chat_id as string
+        if (chatId.startsWith('group:')) {
+          throw new Error('update_contact: chat_id must be a contact, not a group')
+        }
+        const params: Record<string, unknown> = { ...singleRecipientParams(chatId) }
+        if (typeof args.given_name === 'string') params.givenName = args.given_name
+        if (typeof args.family_name === 'string') params.familyName = args.family_name
+        if (typeof args.nick_given_name === 'string') params.nickGivenName = args.nick_given_name
+        if (typeof args.nick_family_name === 'string') params.nickFamilyName = args.nick_family_name
+        if (typeof args.note === 'string') params.note = args.note
+        if (typeof args.expiration === 'number') params.expiration = args.expiration
+        const fields = Object.keys(params).filter(k => k !== 'recipient' && k !== 'username')
+        if (fields.length === 0) {
+          throw new Error('update_contact: provide at least one field to update')
+        }
+        await rpc('updateContact', params)
+        return { content: [{ type: 'text', text: `contact ${chatId} updated (${fields.join(', ')})` }] }
+      }
+      case 'remove_contact': {
+        if (STATIC) throw new Error('remove_contact blocked: SIGNAL_ACCESS_MODE=static')
+        const chatId = args.chat_id as string
+        if (chatId.startsWith('group:')) {
+          throw new Error('remove_contact: chat_id must be a contact, not a group')
+        }
+        if (args.hide === true && args.forget === true) {
+          throw new Error('remove_contact: hide and forget are mutually exclusive')
+        }
+        const params: Record<string, unknown> = { ...singleRecipientParams(chatId) }
+        if (args.hide === true) params.hide = true
+        if (args.forget === true) params.forget = true
+        await rpc('removeContact', params)
+        const mode = args.forget === true ? 'forget' : args.hide === true ? 'hide' : 'clear'
+        return { content: [{ type: 'text', text: `contact ${chatId} removed (${mode})` }] }
+      }
+      case 'join_group': {
+        if (STATIC) throw new Error('join_group blocked: SIGNAL_ACCESS_MODE=static')
+        const uri = args.uri as string
+        const result = await rpc('joinGroup', { uri })
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+      }
+      case 'quit_group': {
+        if (STATIC) throw new Error('quit_group blocked: SIGNAL_ACCESS_MODE=static')
+        const raw = args.group_id as string
+        const groupId = raw.startsWith('group:') ? raw.slice(6) : raw
+        const params: Record<string, unknown> = { groupId }
+        if (args.delete === true) params.delete = true
+        if (Array.isArray(args.admins) && args.admins.length > 0) params.admin = args.admins
+        await rpc('quitGroup', params)
+        return { content: [{ type: 'text', text: `quit group ${groupId}` }] }
+      }
+      case 'get_attachment': {
+        const id = args.attachment_id as string
+        const chatId = args.chat_id as string
+        const recipParams: Record<string, unknown> = chatId.startsWith('group:')
+          ? { groupId: chatId.slice(6) }
+          : /^[a-z][a-z0-9_]{2,31}\.\d{2,}$/.test(chatId)
+            ? { username: chatId }
+            : { recipient: chatId }
+        const outputFile = join(SIGNAL_CONFIG, 'attachments', id)
+        await rpc('getAttachment', { id, ...recipParams, outputFile })
+        return { content: [{ type: 'text', text: `attachment ${id} written to ${outputFile}` }] }
+      }
+      case 'update_group': {
+        if (STATIC) throw new Error('update_group blocked: SIGNAL_ACCESS_MODE=static')
+        const raw = args.group_id as string
+        const groupId = raw.startsWith('group:') ? raw.slice(6) : raw
+        const params: Record<string, unknown> = { groupId }
+        if (typeof args.name === 'string') params.name = args.name
+        if (typeof args.description === 'string') params.description = args.description
+        if (typeof args.avatar === 'string') params.avatar = args.avatar
+        if (typeof args.expiration === 'number') params.expiration = args.expiration
+        if (Array.isArray(args.members) && args.members.length) params.member = args.members
+        if (Array.isArray(args.remove_members) && args.remove_members.length) params.removeMember = args.remove_members
+        if (Array.isArray(args.admins) && args.admins.length) params.admin = args.admins
+        if (Array.isArray(args.remove_admins) && args.remove_admins.length) params.removeAdmin = args.remove_admins
+        if (Array.isArray(args.banned) && args.banned.length) params.ban = args.banned
+        if (Array.isArray(args.unbanned) && args.unbanned.length) params.unban = args.unbanned
+        if (typeof args.link === 'string') params.link = args.link
+        if (typeof args.permission_add_member === 'string') params.setPermissionAddMember = args.permission_add_member
+        if (typeof args.permission_edit_details === 'string') params.setPermissionEditDetails = args.permission_edit_details
+        if (typeof args.permission_send_messages === 'string') params.setPermissionSendMessages = args.permission_send_messages
+        const fields = Object.keys(params).filter(k => k !== 'groupId')
+        if (fields.length === 0) {
+          throw new Error('update_group: provide at least one field to update')
+        }
+        await rpc('updateGroup', params)
+        return { content: [{ type: 'text', text: `group ${groupId} updated (${fields.join(', ')})` }] }
+      }
       default:
         return {
           content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }],
@@ -967,10 +1466,65 @@ mcp.setNotificationHandler(
 // --- inbound dispatch --------------------------------------------------------
 
 function onEnvelope(env: SignalEnvelope) {
+  // receiptMessage: a recipient has acknowledged one or more of our outbound
+  // messages. Surface via the canonical channel notification method
+  // (notifications/claude/channel) with meta.event_type='receipt' as a
+  // discriminator. Sub-method routing (e.g. .../channel/receipt) was tested
+  // and found NOT to be surfaced by the Claude Code host even with the
+  // matching capability declared — the host only routes the canonical
+  // method into sessions. v0.6's reaction/group_update/contact_update
+  // routings should follow the same discriminator pattern.
+  // Filter to read/viewed only — delivery receipts fire 1-2× per outbound
+  // and would pollute the channel with no marginal value.
+  if (env.receiptMessage) {
+    const r = env.receiptMessage
+    if (r.isRead || r.isViewed) {
+      const type = r.isViewed ? 'viewed' : 'read'
+      const targets = (r.timestamps ?? []).join(',')
+      void mcp.notification({
+        method: 'notifications/claude/channel',
+        params: {
+          content: `[receipt:${type}] target_timestamps=${targets}`,
+          meta: {
+            chat_id: env.source ?? 'unknown',
+            message_id: String(r.when),
+            user: env.sourceName || env.source || env.sourceUuid || 'unknown',
+            ts: new Date(env.timestamp).toISOString(),
+            event_type: 'receipt',
+            receipt_type: type,
+            target_timestamps: targets,
+          },
+        },
+      })
+    }
+    return
+  }
+
+  // contacts sync from a linked device. Surfaced so Claude knows local contact
+  // state may have shifted (e.g. nickname/note changed on the user's phone) and
+  // can re-fetch via list_contacts. The actual contact diff is delivered as an
+  // attachment blob signal-cli decodes internally; we don't unpack it here.
+  if (env.syncMessage?.contacts) {
+    void mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: '[contact_update] linked-device contacts sync',
+        meta: {
+          chat_id: 'sync',
+          message_id: String(env.timestamp),
+          user: env.sourceName || env.source || env.sourceUuid || 'unknown',
+          ts: new Date(env.timestamp).toISOString(),
+          event_type: 'contact_update',
+        },
+      },
+    })
+    return
+  }
+
   // syncMessage.sentMessage: own-account → ... ; sender is us, chat is destination.
   const sent = env.syncMessage?.sentMessage
   const data = sent ?? env.editMessage?.dataMessage ?? env.dataMessage
-  if (!data) return // delivery receipts, typing, read receipts: ignore.
+  if (!data) return // typing indicators, other non-message envelopes: ignore.
 
   const text = data.message ?? ''
   const attachment = data.attachments?.[0]
@@ -1016,7 +1570,7 @@ function onEnvelope(env: SignalEnvelope) {
   // owner-to-owner syncMessages and the owner DMing the linked account would
   // hit the pairing gate.
   if (senderId !== OWNER) {
-    const result = gate({ senderId, chatId, isGroup, text })
+    const result = gate({ senderId, chatId, isGroup, text, mentions: data.mentions })
     if (result.action === 'drop') return
     if (result.action === 'pair') {
       const lead = result.isResend ? 'Still pending' : 'Pairing required'
@@ -1029,6 +1583,20 @@ function onEnvelope(env: SignalEnvelope) {
         )
         .catch(err =>
           process.stderr.write(`signal channel: pairing code send failed: ${err}\n`),
+        )
+      return
+    }
+    if (result.action === 'group_pair') {
+      const groupName = data.groupInfo?.groupName ?? chatId
+      const message =
+        `You added me to "${groupName}". To allow me to participate, run in your Claude Code terminal:\n\n` +
+        `/signal:access group pair ${result.code}`
+      rpc('send', { ...recipientParams(OWNER), message })
+        .then(r =>
+          recordSent(OWNER, message, (r as { timestamp?: number })?.timestamp ?? Date.now()),
+        )
+        .catch(err =>
+          process.stderr.write(`signal channel: group pairing prompt failed: ${err}\n`),
         )
       return
     }
@@ -1063,6 +1631,67 @@ function onEnvelope(env: SignalEnvelope) {
         process.stderr.write(`signal channel: auto-receipt failed: ${err}\n`),
       )
     }
+  }
+
+  // Reaction-only dataMessage: emit a structured reaction event and skip the
+  // generic notify (which would have empty content). recordReceived above
+  // captures it in sqlite with empty text — fine for thread reconstruction.
+  if (data.reaction) {
+    const reaction = data.reaction
+    // signal-cli emits reaction.targetAuthor as a flat string (recipient identifier),
+    // not the {uuid, number} object the JSON envelope schema documentation suggested.
+    // Prefer the explicit *Uuid/*Number siblings; fall back to the flat targetAuthor.
+    const ta =
+      typeof reaction.targetAuthor === 'string' ? reaction.targetAuthor : undefined
+    const targetAuthor =
+      reaction.targetAuthorUuid ?? reaction.targetAuthorNumber ?? ta ?? 'unknown'
+    const isRemove = reaction.isRemove === true
+    void mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        // Channel meta values must be strings — Claude Code's channel router
+        // silently drops events whose meta contains numbers/booleans. Stringify
+        // every non-string value before emit.
+        content: `[reaction:${isRemove ? 'remove' : 'add'}] ${reaction.emoji} → ${reaction.targetSentTimestamp}`,
+        meta: {
+          chat_id: chatId,
+          message_id: messageId,
+          user: env.sourceName || senderId || env.sourceUuid || 'unknown',
+          ts: new Date(env.timestamp).toISOString(),
+          event_type: 'reaction',
+          emoji: reaction.emoji,
+          target_author: targetAuthor,
+          target_sent_timestamp: String(reaction.targetSentTimestamp),
+          is_remove: String(isRemove),
+        },
+      },
+    })
+    return
+  }
+
+  // Group metadata change (rename, member add/remove, permission change, etc.)
+  // arrives as a dataMessage with groupInfo.type='UPDATE' and no message text.
+  // 'DELIVER' is the type for normal group messages; we want only metadata events.
+  if (data.groupInfo?.type === 'UPDATE') {
+    const gi = data.groupInfo
+    void mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        // Channel meta values must be strings; stringify revision.
+        content: `[group_update] ${gi.groupName ?? gi.groupId}${gi.revision != null ? ` rev=${gi.revision}` : ''}`,
+        meta: {
+          chat_id: chatId,
+          message_id: messageId,
+          user: env.sourceName || senderId || env.sourceUuid || 'unknown',
+          ts: new Date(env.timestamp).toISOString(),
+          event_type: 'group_update',
+          group_id: gi.groupId,
+          group_name: gi.groupName ?? '',
+          revision: String(gi.revision ?? 0),
+        },
+      },
+    })
+    return
   }
 
   void mcp.notification({
@@ -1362,7 +1991,7 @@ spawnSignalCli()
 // file storing the last-set name. Skip if marker matches configured name;
 // re-set if it differs (e.g. user changed SIGNAL_PROFILE_NAME). Empty value
 // disables. Fire-and-forget; never blocks startup, never fatal on failure.
-const PROFILE_NAME =
+let PROFILE_NAME =
   process.env.SIGNAL_PROFILE_NAME ?? envFile.SIGNAL_PROFILE_NAME ?? 'OpenClaw'
 
 if (PROFILE_NAME) {
