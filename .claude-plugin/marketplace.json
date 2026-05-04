@@ -1,0 +1,18 @@
+{
+  "$schema": "https://code.claude.com/schemas/plugin-marketplace.json",
+  "name": "claude-signal",
+  "description": "Self-hosted marketplace for the signal-channel Claude Code plugin",
+  "owner": { "name": "bufothefrog" },
+  "plugins": [
+    {
+      "name": "signal",
+      "description": "Signal messaging integration via signal-cli's JSON-RPC bridge. Inbound DMs, groups, attachments, edits, reactions, and receipts surface as channel notifications; outbound goes through the reply tool. Includes group/contact/profile management, allowlist + pairing access control, and optional persistent message history.",
+      "version": "1.1.0",
+      "source": {
+        "source": "github",
+        "repo": "bufothefrog/claude-signal",
+        "ref": "v1.1.0"
+      }
+    }
+  ]
+}
