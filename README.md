@@ -38,13 +38,7 @@ run `/signal:configure` with no arguments to see all toggles and their current v
 
 ## profile name
 
-freshly registered signal-cli accounts have no profile, so messages from them show up as "unknown contact" until profile keys are exchanged. set a display name via `SIGNAL_PROFILE_NAME` and the bridge will apply it on first boot:
-
-```
-/signal:configure profile-name <your-name>
-```
-
-or directly in `~/.claude/channels/signal/.env` as `SIGNAL_PROFILE_NAME=<your-name>`. default is empty (no auto-set) — the bridge leaves your signal profile untouched until you opt in. the bridge writes a marker file at `~/.claude/channels/signal/.profile-set` and only re-applies if the configured name changes — your signal profile won't be silently overwritten on subsequent boots. delete the marker if you ever need to force a re-set.
+set a signal display name via `/signal:configure profile-name <name>` or `SIGNAL_PROFILE_NAME=<name>` in `.env`. the bridge applies it on first boot and tracks the last-applied value at `~/.claude/channels/signal/.profile-set` so it never overwrites a manually-changed profile on subsequent boots — delete the marker if you ever need to force a re-apply. empty by default (no auto-set).
 
 ## access control
 
@@ -123,15 +117,7 @@ owner defaults to the linked account. override with:
 
 ## running long-lived
 
-the plugin itself is a Claude Code MCP server — it lives and dies with your Claude Code session. keeping the session up between machines is OS-specific, so the plugin doesn't pick a winner. some lightweight options:
-
-- **tmux / screen / zellij** — simplest cross-platform answer. start `claude` in a detached tmux session; reattach when you want to read along.
-- **nohup + log** — `nohup claude --channels plugin:signal@<your-marketplace> > ~/claude.log 2>&1 &`.
-- **macOS launchd** — write a per-user `LaunchAgent` plist; `launchctl load` it.
-- **Linux systemd** — community-contributed example unit at [`contrib/systemd/claude-signal.service`](./contrib/systemd/claude-signal.service); see comments inside for `loginctl enable-linger` if you want it to run without an active login.
-- **Windows** — Task Scheduler with "run whether user is logged on or not", or a wrapper service via NSSM.
-
-contributions of additional service-manager examples to `contrib/` are welcome.
+the plugin lives and dies with your claude code session. to keep it alive, use your OS's standard process manager — `tmux` / `screen` / `zellij` for cross-platform terminal multiplexing, or a service manager like `launchd` (macOS), `systemd` (Linux), or Task Scheduler (Windows) for unattended operation. see [`contrib/`](./contrib/) for community-contributed service definitions; PRs welcome for additional examples.
 
 ## troubleshooting
 

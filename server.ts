@@ -29,7 +29,7 @@ import {
   renameSync,
   realpathSync,
 } from 'fs'
-import { homedir } from 'os'
+import { homedir, userInfo } from 'os'
 import { join, sep } from 'path'
 import { Database } from 'bun:sqlite'
 
@@ -328,15 +328,22 @@ function isMentioned(
 
 // --- assertSendable ----------------------------------------------------------
 
-// reply's files param takes any path. The bridge's own state dir is the one
-// thing Claude has no reason to ever send. Refuse paths that resolve under it.
+// File-path arguments to outbound tools (reply.files, update_profile.avatar,
+// update_group.avatar) are LLM-controlled. The bridge's own state dir is the
+// one thing Claude has no reason to ever send out. Refuse paths that resolve
+// under it. Fail closed on unresolvable paths — a non-existent or broken-
+// symlink path would otherwise pass silently and could open a TOCTOU window
+// where the path comes into existence under STATE_DIR between the check and
+// signal-cli's read.
 function assertSendable(f: string): void {
   let real: string
   let stateReal: string
   try {
     real = realpathSync(f)
     stateReal = realpathSync(STATE_DIR)
-  } catch { return }
+  } catch {
+    throw new Error(`refusing to send unresolvable path: ${f}`)
+  }
   if (real === stateReal || real.startsWith(stateReal + sep)) {
     throw new Error(`refusing to send channel state: ${f}`)
   }
@@ -960,7 +967,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         '(<config>/attachments/<id>, the same path channel events use). signal-cli garbage-collects attachments after a ' +
         'window; use this when an inbound channel event\'s file_path no longer resolves. ' +
         'Required: attachment_id (the id from a previous channel event\'s file_path or message_id). ' +
-        'Required: chat_id (the conversation the attachment came from — UUID/phone/username for DM, group:<base64> for group). Read-only.',
+        'Required: chat_id (the conversation the attachment came from — UUID/phone/username for DM, group:<base64> for group). Writes a file but does not require the SIGNAL_ACCESS_MODE=static gate (signal-cli\'s side effect, not a state mutation).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1314,7 +1321,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (hasAvatar && removeAvatar) {
           throw new Error('update_profile: avatar and remove_avatar are mutually exclusive')
         }
-        if (hasAvatar) params.avatar = args.avatar
+        if (hasAvatar) {
+          assertSendable(args.avatar as string)
+          params.avatar = args.avatar
+        }
         if (removeAvatar) params.removeAvatar = true
         if (Object.keys(params).length === 0) {
           throw new Error('update_profile: provide at least one field to update')
@@ -1377,6 +1387,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'get_attachment': {
         const id = args.attachment_id as string
+        // Real attachment IDs are opaque alphanumeric tokens. Reject anything
+        // with slashes, dots, or other non-token characters — prevents the
+        // LLM from being prompt-injected into writing signal-cli-fetched bytes
+        // outside the attachments dir (e.g. ../../.bashrc, ../.env).
+        if (!/^[A-Za-z0-9_-]+$/.test(id)) {
+          throw new Error(`get_attachment: invalid attachment_id (must match [A-Za-z0-9_-])`)
+        }
         const chatId = args.chat_id as string
         const recipParams: Record<string, unknown> = chatId.startsWith('group:')
           ? { groupId: chatId.slice(6) }
@@ -1394,7 +1411,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const params: Record<string, unknown> = { groupId }
         if (typeof args.name === 'string') params.name = args.name
         if (typeof args.description === 'string') params.description = args.description
-        if (typeof args.avatar === 'string') params.avatar = args.avatar
+        if (typeof args.avatar === 'string') {
+          assertSendable(args.avatar)
+          params.avatar = args.avatar
+        }
         if (typeof args.expiration === 'number') params.expiration = args.expiration
         if (Array.isArray(args.members) && args.members.length) params.member = args.members
         if (Array.isArray(args.remove_members) && args.remove_members.length) params.removeMember = args.remove_members
@@ -1540,6 +1560,11 @@ function onEnvelope(env: SignalEnvelope) {
   if (sent && consumeEcho(chatId, text)) return
 
   // Permission reply consumer: only honor replies from OWNER, BEFORE the gate.
+  // Ordering note: this runs AFTER `consumeEcho` (above). The bridge currently
+  // never sends text matching PERMISSION_REPLY_RE, so the echo filter doesn't
+  // shadow this path. If a future feature ever relays user-typed acks via
+  // outbound `send`, that outbound's syncMessage loopback would be consumed by
+  // the echo filter, which is the desired behavior — but worth knowing.
   if (senderId === OWNER && text) {
     const m = PERMISSION_REPLY_RE.exec(text)
     if (m) {
@@ -1866,7 +1891,12 @@ function spawnSignalCli(): void {
 // blocks on the global accounts lock when an orphan holds it, so we'd hang
 // trying to learn our own account.
 function cleanupStaleBridges(): void {
-  const myUser = process.env.USER ?? ''
+  // Fall back to userInfo().username when USER is unset (some service managers
+  // strip env). Without this, cleanup silently no-ops and orphan bridges from
+  // prior crashes accumulate.
+  const myUser = process.env.USER ?? (() => {
+    try { return userInfo().username } catch { return '' }
+  })()
   if (!myUser) return
   const ps = spawnSync('ps', ['-u', myUser, '-o', 'pid=,ppid=,command='], {
     encoding: 'utf8',

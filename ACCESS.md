@@ -22,7 +22,7 @@ set with `/signal:access policy <pairing|allowlist|disabled>`.
 
 ## sender IDs are UUIDs
 
-modern signal-cli identifies senders by UUID, not phone number. `chat_id` for a DM looks like `d22824d4-1234-5678-9abc-def012345678`. group IDs look like `group:<base64>`. the allowlist stores UUIDs.
+modern signal-cli identifies senders by UUID, not phone number. `chat_id` for a DM looks like `<8-4-4-4-12 hex uuid>` (e.g. `00000000-0000-0000-0000-000000000000`). group IDs look like `group:<base64>`. the allowlist stores UUIDs.
 
 pairing captures the UUID for you. if you need one manually, check the `chat_id` field in a recent inbound notification or look at the `pending` entries in `access.json`.
 

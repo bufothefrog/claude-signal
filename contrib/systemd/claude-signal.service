@@ -19,7 +19,7 @@
 # `claude` and `bun` are on PATH via the user's login shell (e.g. ~/.local/bin).
 
 [Unit]
-Description=Claude Code session with signal-channel plugin (OpenClaw)
+Description=Claude Code session with signal-channel plugin
 Documentation=https://github.com/anthropics/claude-code
 After=network-online.target
 Wants=network-online.target
