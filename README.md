@@ -95,6 +95,8 @@ inbound and outbound messages are persisted to `~/.claude/channels/signal/messag
 
 **install-time limitation:** messages from before v0.3 install are not in the cache. signal-cli has no `listMessages` command, so historical bootstrap isn't possible — capture is reactive from the moment the upgraded bridge starts.
 
+**opt out:** set `SIGNAL_DISABLE_HISTORY=true` in `.env` to skip the database entirely. live message routing keeps working, the `authors.json` display-name cache keeps tracking, but `chat_messages` / `react` / `mark_read` start throwing a clear "history disabled" error. useful for privacy-conscious deploys and ephemeral / stateless containers.
+
 ## auto read-receipts (optional)
 
 by default, a sender doesn't know the bridge saw their message until claude calls `mark_read` (or sends a reply). flip this with:

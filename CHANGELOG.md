@@ -2,7 +2,24 @@
 
 All notable changes to `signal-channel` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [SemVer](https://semver.org/).
 
-## [1.0.0] - 2026-05-03
+## [1.1.0] - 2026-05-04
+
+Theme: optional message history. The SQLite message-history database (`messages.db`) can now be disabled at boot via `SIGNAL_DISABLE_HISTORY=true`. Useful for privacy-conscious deploys (no plain-text at rest) and ephemeral / stateless containers (no growing state files to gitignore from deploy artifacts). Default behavior unchanged.
+
+### Added
+
+- `SIGNAL_DISABLE_HISTORY` env var (default `false`). When `true`:
+  - Bridge skips initialization of `messages.db` entirely (no schema creation, no file writes).
+  - `recordSent` and `recordReceived` early-return; live channel routing is unaffected.
+  - `authors.json` (the lightweight display-name cache, used by `/signal:status` for "top 5 authors" and similar) continues to be written — author tracking is preserved.
+  - The `chat_messages`, `react`, and `mark_read` tools throw a clear "history is disabled (SIGNAL_DISABLE_HISTORY=true)" error when invoked. `react` and `mark_read` need the original sender of a previously-received message for signal-cli's `targetAuthor` / receipt routing, which is only known via DB lookup.
+  - The `reply` tool's `reply_to` quote-author enrichment falls back to "no author name" gracefully (existing v1.0 behavior; no dispatch change needed).
+  - `/signal:status` shows `history: disabled` and skips the History section's file-metadata + query rendering.
+- `.env.example` entry, `README.md` "history & search" section opt-out paragraph, `SECURITY.md` "Privacy note" section extended with the toggle's threat-model implications.
+
+### Changed
+
+- `recordReceived` now calls `authorsTouch` *before* the DB write rather than after. This is required for the disable path (so display names track even when the DB is absent) and is a behavior-neutral reorder for the default path.
 
 Promotion to v1.0 after hands-on validation: group pairing flow verified end-to-end with real Signal traffic (DM-to-OWNER prompt routing, code-keyed approval, structured @-mention detection), `dmPolicy`/`groupPolicy` independence working as designed, dynamic profile-name mention pattern surviving runtime renames. Versioning per the v0.6 versioning decision: v1.0 is gated on hands-on confidence, not feature-completeness alone. The work shipped in this release was developed and tagged internally as v0.7; promoting directly to v1.0 because no other gating criteria remain.
 

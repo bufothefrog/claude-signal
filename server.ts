@@ -95,6 +95,13 @@ const SIGNAL_CONFIG =
   join(homedir(), '.local', 'share', 'signal-cli')
 const AUTO_READ_RECEIPTS =
   (process.env.SIGNAL_AUTO_READ_RECEIPTS ?? envFile.SIGNAL_AUTO_READ_RECEIPTS) === 'true'
+// Opt-out for the SQLite message-history database. When true, the bridge skips
+// initializing messages.db, recordSent/recordReceived become no-ops, and the
+// chat_messages/react/mark_read tools throw a clear "history disabled" error.
+// authors.json (the lightweight display-name cache) and live channel routing
+// are unaffected.
+const DISABLE_HISTORY =
+  (process.env.SIGNAL_DISABLE_HISTORY ?? envFile.SIGNAL_DISABLE_HISTORY) === 'true'
 
 // Resolved at startup, before mcp.connect, after listAccounts.
 let currentAccount = ''
@@ -384,8 +391,12 @@ function consumeEcho(chatId: string, text: string): boolean {
 // SQLite for chat history (unbounded, indexed). JSON for the authors index
 // (bounded, hand-inspectable, write-coalesced). Both rooted at STATE_DIR.
 
-function initDb(): Database {
+function initDb(): Database | null {
+  // STATE_DIR creation runs unconditionally — access.json, .profile-set, and
+  // authors.json all live under it regardless of whether history persistence
+  // is enabled.
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+  if (DISABLE_HISTORY) return null
   const d = new Database(MESSAGES_DB, { create: true })
   d.exec(`
     CREATE TABLE IF NOT EXISTS messages (
@@ -407,7 +418,7 @@ function initDb(): Database {
   return d
 }
 
-const db: Database = initDb()
+const db: Database | null = initDb()
 
 // --- authors index (richer messageAuthors replacement) ----------------------
 
@@ -479,6 +490,7 @@ function recordSent(
   editedTarget?: number,
 ): void {
   trackEcho(chatId, text)
+  if (!db) return
   try {
     db.run(
       `INSERT OR IGNORE INTO messages
@@ -509,6 +521,11 @@ function recordReceived(
   attachmentPath?: string,
   editedTarget?: number,
 ): void {
+  // Author tracking runs regardless of history persistence — authors.json is
+  // a separate, smaller cache used for display-name lookup and is independent
+  // of the messages.db row data.
+  authorsTouch(senderId, sourceName, ts)
+  if (!db) return
   try {
     db.run(
       `INSERT OR IGNORE INTO messages
@@ -524,7 +541,6 @@ function recordReceived(
         editedTarget ?? null,
       ],
     )
-    authorsTouch(senderId, sourceName, ts)
   } catch (err) {
     process.stderr.write(`signal channel: recordReceived insert failed: ${err}\n`)
   }
@@ -533,6 +549,7 @@ function recordReceived(
 // Replaces the in-memory messageAuthors Map. Cross-session reactions now work
 // because the row survives bridge restart.
 function authorByMessageId(messageId: string): string | undefined {
+  if (!db) return undefined
   try {
     const row = db
       .query<{ sender_id: string }, [string]>(
@@ -1126,6 +1143,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: `edited (${ts})` }] }
       }
       case 'react': {
+        if (!db) throw new Error('react: requires SIGNAL_DISABLE_HISTORY=false (history is disabled, so the bridge cannot look up the original sender of message_id)')
         const chatId = args.chat_id as string
         const messageId = args.message_id as string
         const emoji = args.emoji as string
@@ -1157,6 +1175,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: stop ? 'stopped' : 'typing' }] }
       }
       case 'chat_messages': {
+        if (!db) throw new Error('chat_messages: history is disabled (SIGNAL_DISABLE_HISTORY=true)')
         const where: string[] = []
         const bindings: (string | number)[] = []
         if (typeof args.chat_id === 'string' && args.chat_id) {
@@ -1228,6 +1247,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: JSON.stringify(groups, null, 2) }] }
       }
       case 'mark_read': {
+        if (!db) throw new Error('mark_read: requires SIGNAL_DISABLE_HISTORY=false (history is disabled, so the bridge cannot look up the original sender of message_id)')
         const messageId = args.message_id as string
         const sender = authorByMessageId(messageId)
         if (!sender) {

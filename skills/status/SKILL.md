@@ -39,6 +39,7 @@ surface the four behavior toggles so the user can see what's on/off without open
 2. **auto read-receipts**: resolve `process.env.SIGNAL_AUTO_READ_RECEIPTS` > `.env`'s `SIGNAL_AUTO_READ_RECEIPTS` > unset. interpret as **on** if the literal lowercase value is `true`, otherwise **off**. label the source.
 3. **append signature**: same precedence + same `=== 'true'` semantics for `SIGNAL_APPEND_SIGNATURE`.
 4. **access mode**: resolve `process.env.SIGNAL_ACCESS_MODE` > `.env`'s `SIGNAL_ACCESS_MODE` > unset. show `static (frozen)` if the value is `static`, otherwise `dynamic` (default). label the source.
+5. **history**: resolve `process.env.SIGNAL_DISABLE_HISTORY` > `.env`'s `SIGNAL_DISABLE_HISTORY` > unset. show `disabled` if the literal lowercase value is `true`, otherwise `enabled` (default). label the source.
 
 format each as a single line, e.g.:
 ```
@@ -46,6 +47,7 @@ profile name:        (disabled — empty) (default)
 auto read-receipts:  off                (default)
 append signature:    on                 (.env)
 access mode:         dynamic            (default)
+history:             enabled            (default)
 ```
 
 mention `/signal:configure auto-receipts on|off`, `signature on|off`, `profile-name <name>` as the way to change these.
@@ -67,12 +69,13 @@ mention `/signal:configure auto-receipts on|off`, `signature on|off`, `profile-n
 
 ### History
 
-1. for `~/.claude/channels/signal/messages.db`: print path, exists?, size, last-modified timestamp (same stat fallback as above).
-2. if it exists and `sqlite3` is on PATH, run a few quick queries and show the results:
+1. **if `SIGNAL_DISABLE_HISTORY=true`** (resolved via the same env > .env precedence): print `history: disabled` and skip the entire section — the bridge isn't writing the DB and the chat_messages/react/mark_read tools are intentionally unavailable. label the source.
+2. otherwise, for `~/.claude/channels/signal/messages.db`: print path, exists?, size, last-modified timestamp (same stat fallback as above).
+3. if it exists and `sqlite3` is on PATH, run a few quick queries and show the results:
    - `SELECT COUNT(*) FROM messages` — total messages captured.
    - `SELECT direction, COUNT(*) FROM messages GROUP BY direction` — in/out split.
    - `SELECT COUNT(DISTINCT chat_id) FROM messages` — distinct chats observed.
-3. if `sqlite3` isn't on PATH, say so and skip the query portion — file metadata is still useful.
+4. if `sqlite3` isn't on PATH, say so and skip the query portion — file metadata is still useful.
 
 ### Authors
 
