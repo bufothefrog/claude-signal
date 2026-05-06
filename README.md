@@ -171,6 +171,10 @@ Run `/signal:access` to inspect current state.
 | `update_group` | Rename / change description / membership / admins / permissions on a group the bridge admins. |
 | `update_profile` | Update the bridge account's own profile (`given_name`, `about`, `avatar`, etc.). |
 
+### Errors
+
+Tools surface failures through the standard MCP error path. The bridge throws a JS `Error` from inside the `CallToolRequestSchema` handler; the MCP SDK translates that into a tool result with `isError: true` and a `content: [{ type: "text", text: <message> }]` payload. Where the underlying signal-cli call returned a structured `error.data` (e.g. `SendMessageException` causes like `UntrustedIdentity`, `NotRegistered`, `MissingProfileKey`), the bridge preserves that detail in the message so Claude can reason about what to retry, prompt the user about, or fall back to. Mutating tools throw a uniform `'<tool_name> blocked: SIGNAL_ACCESS_MODE=static'` when the bridge is running in static mode.
+
 ## Channel events
 
 Inbound traffic surfaces as `notifications/claude/channel` events distinguished by `meta.event_type`. All events share `chat_id`, `message_id`, `user`, and `ts` in `meta`; the type-specific fields are listed below.

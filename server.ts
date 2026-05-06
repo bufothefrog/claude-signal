@@ -691,10 +691,30 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          chat_id: { type: 'string' },
-          text: { type: 'string' },
-          reply_to: { type: 'string' },
-          files: { type: 'array', items: { type: 'string' } },
+          chat_id: {
+            type: 'string',
+            description:
+              'A UUID or phone for a DM (e.g. "00000000-0000-0000-0000-000000000000" or "+15551234567"), ' +
+              'or "group:<base64>" for a group. Usernames (e.g. "alice.42") also accepted for contacts.',
+          },
+          text: {
+            type: 'string',
+            description:
+              'Message body. The bridge splits long text per textChunkLimit (default 2000) ' +
+              'unless reply_to or files is set, in which case the message is sent as a single chunk.',
+          },
+          reply_to: {
+            type: 'string',
+            description:
+              'A message_id (timestamp) from a prior message in the same chat. Makes this a quote-reply, ' +
+              'rendering the original underneath the new message.',
+          },
+          files: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Absolute paths to local files to attach. The bridge refuses paths inside its own state dir.',
+          },
         },
         required: ['chat_id', 'text'],
       },
@@ -708,9 +728,20 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          chat_id: { type: 'string' },
-          message_id: { type: 'string' },
-          text: { type: 'string' },
+          chat_id: {
+            type: 'string',
+            description: 'The chat the original message was sent in. UUID/phone for DM, "group:<base64>" for group.',
+          },
+          message_id: {
+            type: 'string',
+            description:
+              'The timestamp string returned by a previous reply or edit_message call. ' +
+              'Also surfaced as message_id in chat_messages output for direction="out" rows.',
+          },
+          text: {
+            type: 'string',
+            description: 'New message body. Replaces the previous text entirely.',
+          },
         },
         required: ['chat_id', 'message_id', 'text'],
       },
@@ -723,9 +754,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          chat_id: { type: 'string' },
-          message_id: { type: 'string' },
-          emoji: { type: 'string' },
+          chat_id: {
+            type: 'string',
+            description: 'The chat the target message is in. UUID/phone for DM, "group:<base64>" for group.',
+          },
+          message_id: {
+            type: 'string',
+            description: 'The timestamp of the target message (from a channel event or chat_messages row).',
+          },
+          emoji: {
+            type: 'string',
+            description:
+              'Single emoji (or short emoji sequence). Sending the same emoji again removes the reaction.',
+          },
         },
         required: ['chat_id', 'message_id', 'emoji'],
       },
@@ -738,8 +779,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          chat_id: { type: 'string' },
-          stop: { type: 'boolean' },
+          chat_id: {
+            type: 'string',
+            description: 'The chat to show the indicator in. UUID/phone for DM, "group:<base64>" for group.',
+          },
+          stop: {
+            type: 'boolean',
+            description: 'If true, stops the typing indicator. Defaults to false (start/refresh).',
+          },
         },
         required: ['chat_id'],
       },
@@ -756,23 +803,42 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          chat_id: { type: 'string' },
-          since: { type: 'string' },
-          until: { type: 'string' },
-          search: { type: 'string' },
-          limit: { type: 'number' },
+          chat_id: {
+            type: 'string',
+            description: 'Optional. Scope results to one chat. Omit for global history across all chats.',
+          },
+          since: {
+            type: 'string',
+            description:
+              'Optional lower bound. Accepts ISO 8601 (e.g. "2026-05-01T00:00:00Z") or epoch milliseconds as a string.',
+          },
+          until: {
+            type: 'string',
+            description: 'Optional upper bound. Same formats as since.',
+          },
+          search: {
+            type: 'string',
+            description: 'Optional case-insensitive substring filter on message text.',
+          },
+          limit: {
+            type: 'number',
+            description: 'Maximum rows to return. Default 50, hard cap 500.',
+          },
         },
       },
     },
     {
       name: 'list_contacts',
       description:
-        'List signal-cli contacts. Optional match filters by case-insensitive substring on name/number/uuid. ' +
-        'Useful for finding the chat_id of someone you want to message.',
+        'Use when you have a name or partial number and need the canonical chat_id for reply/react/etc. ' +
+        'Lists signal-cli contacts. Optional match filters by case-insensitive substring on name/number/uuid.',
       inputSchema: {
         type: 'object',
         properties: {
-          match: { type: 'string' },
+          match: {
+            type: 'string',
+            description: 'Optional case-insensitive substring filter on name, number, UUID, or profile name.',
+          },
         },
       },
     },
@@ -785,7 +851,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          match: { type: 'string' },
+          match: {
+            type: 'string',
+            description: 'Optional case-insensitive substring filter on title, id, or description.',
+          },
         },
       },
     },
@@ -798,8 +867,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          chat_id: { type: 'string' },
-          message_id: { type: 'string' },
+          chat_id: {
+            type: 'string',
+            description: 'The chat the message arrived in. UUID/phone for DM, "group:<base64>" for group.',
+          },
+          message_id: {
+            type: 'string',
+            description:
+              'The timestamp of the inbound message (from a channel event). The bridge resolves the original sender ' +
+              'to route the receipt correctly, so groups work transparently.',
+          },
         },
         required: ['chat_id', 'message_id'],
       },
@@ -814,7 +891,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          number: { type: 'string' },
+          number: {
+            type: 'string',
+            description: 'Optional phone number filter (e.g. "+15551234567"). Omit to list all known identities.',
+          },
         },
       },
     },
@@ -828,9 +908,22 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          chat_id: { type: 'string' },
-          trust_all_known_keys: { type: 'boolean' },
-          safety_number: { type: 'string' },
+          chat_id: {
+            type: 'string',
+            description: 'A UUID, phone, or username for a Signal contact. Groups not accepted.',
+          },
+          trust_all_known_keys: {
+            type: 'boolean',
+            description:
+              'Trust whatever identity keys signal-cli currently has for this contact. Convenient but does not verify ' +
+              'the safety number; mutually exclusive with safety_number.',
+          },
+          safety_number: {
+            type: 'string',
+            description:
+              'Trust only this exact safety number string. Rigorous; pair with list_identities to verify the value first. ' +
+              'Mutually exclusive with trust_all_known_keys.',
+          },
         },
         required: ['chat_id'],
       },
@@ -844,7 +937,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          chat_id: { type: 'string' },
+          chat_id: {
+            type: 'string',
+            description: 'A UUID or phone for a contact, or "group:<base64>" for a group.',
+          },
         },
         required: ['chat_id'],
       },
@@ -852,11 +948,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'unblock',
       description:
-        'Unblock a previously-blocked contact or group. Required: chat_id. Throws if SIGNAL_ACCESS_MODE=static.',
+        'Use when block was called and the user wants traffic from that chat to start flowing again. ' +
+        'Required: chat_id (UUID/phone for a contact, "group:<base64>" for a group). ' +
+        'Throws if SIGNAL_ACCESS_MODE=static.',
       inputSchema: {
         type: 'object',
         properties: {
-          chat_id: { type: 'string' },
+          chat_id: {
+            type: 'string',
+            description: 'A UUID or phone for a contact, or "group:<base64>" for a group.',
+          },
         },
         required: ['chat_id'],
       },
@@ -870,7 +971,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          chat_id: { type: 'string' },
+          chat_id: {
+            type: 'string',
+            description: 'A UUID, phone, or username (e.g. "alice.42") for a Signal contact. Groups not accepted.',
+          },
         },
         required: ['chat_id'],
       },
@@ -885,8 +989,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          chat_id: { type: 'string' },
-          target_timestamp: { type: 'number' },
+          chat_id: {
+            type: 'string',
+            description: 'The chat the original outbound went to. UUID/phone for DM, "group:<base64>" for group.',
+          },
+          target_timestamp: {
+            type: 'number',
+            description:
+              'The timestamp the bridge returned when reply (or another outbound) was sent. ' +
+              'Also surfaced as message_id in chat_messages rows where direction="out".',
+          },
         },
         required: ['chat_id', 'target_timestamp'],
       },
@@ -899,13 +1011,22 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          given_name: { type: 'string' },
-          family_name: { type: 'string' },
-          about: { type: 'string' },
-          about_emoji: { type: 'string' },
-          mobile_coin_address: { type: 'string' },
-          avatar: { type: 'string', description: 'Path to a local image file to use as the new avatar.' },
-          remove_avatar: { type: 'boolean' },
+          given_name: { type: 'string', description: 'Display first name shown to recipients.' },
+          family_name: { type: 'string', description: 'Display last name shown to recipients.' },
+          about: { type: 'string', description: 'Profile bio text (the "about" field).' },
+          about_emoji: { type: 'string', description: 'Single emoji shown alongside the about text.' },
+          mobile_coin_address: {
+            type: 'string',
+            description: 'MobileCoin payments address. Advanced; usually leave empty.',
+          },
+          avatar: {
+            type: 'string',
+            description: 'Path to a local image file to use as the new avatar. Mutually exclusive with remove_avatar.',
+          },
+          remove_avatar: {
+            type: 'boolean',
+            description: 'If true, clears the existing avatar. Mutually exclusive with avatar.',
+          },
         },
       },
     },
@@ -919,13 +1040,36 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          chat_id: { type: 'string' },
-          given_name: { type: 'string' },
-          family_name: { type: 'string' },
-          nick_given_name: { type: 'string' },
-          nick_family_name: { type: 'string' },
-          note: { type: 'string' },
-          expiration: { type: 'number', description: 'Disappearing-message expiration in seconds. 0 disables.' },
+          chat_id: {
+            type: 'string',
+            description: 'A UUID, phone, or username for a Signal contact. Groups not accepted.',
+          },
+          given_name: {
+            type: 'string',
+            description: "Override the contact's first name (local-only display).",
+          },
+          family_name: {
+            type: 'string',
+            description: "Override the contact's last name (local-only display).",
+          },
+          nick_given_name: {
+            type: 'string',
+            description: 'Local nickname first name; overrides given_name in UI.',
+          },
+          nick_family_name: {
+            type: 'string',
+            description: 'Local nickname last name; overrides family_name in UI.',
+          },
+          note: {
+            type: 'string',
+            description: 'Free-form local note attached to this contact.',
+          },
+          expiration: {
+            type: 'number',
+            description:
+              'Disappearing-message expiration in seconds. 0 disables. ' +
+              'Common values: 30, 300 (5 min), 3600 (1 hr), 86400 (1 day), 604800 (1 week).',
+          },
         },
         required: ['chat_id'],
       },
@@ -940,9 +1084,22 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          chat_id: { type: 'string' },
-          hide: { type: 'boolean' },
-          forget: { type: 'boolean' },
+          chat_id: {
+            type: 'string',
+            description: 'A UUID, phone, or username for a Signal contact. Groups not accepted.',
+          },
+          hide: {
+            type: 'boolean',
+            description:
+              'Reversible removal. Keeps message history; drops the entry from the contact list. ' +
+              'Re-adding restores the contact. Mutually exclusive with forget.',
+          },
+          forget: {
+            type: 'boolean',
+            description:
+              'Irreversible removal. Wipes all local data including identity keys; requires re-pairing to restore. ' +
+              'Mutually exclusive with hide.',
+          },
         },
         required: ['chat_id'],
       },
@@ -955,7 +1112,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          uri: { type: 'string' },
+          uri: {
+            type: 'string',
+            description: 'A signal.group invite URL (starts with "https://signal.group/#" or "sgnl://signal.group/#").',
+          },
         },
         required: ['uri'],
       },
@@ -970,9 +1130,22 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          group_id: { type: 'string' },
-          delete: { type: 'boolean' },
-          admins: { type: 'array', items: { type: 'string' } },
+          group_id: {
+            type: 'string',
+            description:
+              'The group identifier. Accepts bare base64 or the "group:<base64>" form surfaced in chat_messages.',
+          },
+          delete: {
+            type: 'boolean',
+            description: 'If true, also wipes local group state (membership cache, etc.). Defaults to false (just leave).',
+          },
+          admins: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'UUIDs/phones to promote as new admins if the bridge is the last admin. ' +
+              'The bridge will refuse to leave otherwise.',
+          },
         },
         required: ['group_id'],
       },
@@ -988,8 +1161,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          attachment_id: { type: 'string' },
-          chat_id: { type: 'string' },
+          attachment_id: {
+            type: 'string',
+            description: 'The attachment ID from a prior channel event (filename portion of file_path) or message_id.',
+          },
+          chat_id: {
+            type: 'string',
+            description: 'The chat the attachment came from. UUID/phone for DM, "group:<base64>" for group.',
+          },
         },
         required: ['attachment_id', 'chat_id'],
       },
@@ -1005,21 +1184,69 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          group_id: { type: 'string' },
-          name: { type: 'string' },
-          description: { type: 'string' },
-          avatar: { type: 'string' },
-          expiration: { type: 'number' },
-          members: { type: 'array', items: { type: 'string' } },
-          remove_members: { type: 'array', items: { type: 'string' } },
-          admins: { type: 'array', items: { type: 'string' } },
-          remove_admins: { type: 'array', items: { type: 'string' } },
-          banned: { type: 'array', items: { type: 'string' } },
-          unbanned: { type: 'array', items: { type: 'string' } },
-          link: { type: 'string', enum: ['enabled', 'enabled-with-approval', 'disabled'] },
-          permission_add_member: { type: 'string', enum: ['every-member', 'only-admins'] },
-          permission_edit_details: { type: 'string', enum: ['every-member', 'only-admins'] },
-          permission_send_messages: { type: 'string', enum: ['every-member', 'only-admins'] },
+          group_id: {
+            type: 'string',
+            description: 'The group identifier. Accepts bare base64 or "group:<base64>".',
+          },
+          name: { type: 'string', description: 'New group title.' },
+          description: { type: 'string', description: 'New group description (the long blurb, not the title).' },
+          avatar: { type: 'string', description: 'Path to a local image file to use as the new group avatar.' },
+          expiration: {
+            type: 'number',
+            description: 'Disappearing-message expiration in seconds. 0 disables. Applies to the whole group.',
+          },
+          members: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'UUIDs, phones, or usernames to add as members.',
+          },
+          remove_members: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'UUIDs, phones, or usernames to remove. Bridge must be an admin.',
+          },
+          admins: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Members to promote to admin. Each must already be a member.',
+          },
+          remove_admins: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Admins to demote back to regular member.',
+          },
+          banned: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'UUIDs, phones, or usernames to ban from the group.',
+          },
+          unbanned: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Previously-banned identifiers to unban.',
+          },
+          link: {
+            type: 'string',
+            enum: ['enabled', 'enabled-with-approval', 'disabled'],
+            description:
+              'Group invite-link state. enabled = anyone with the link can join; ' +
+              'enabled-with-approval = link works but admins must approve each join; disabled = no link.',
+          },
+          permission_add_member: {
+            type: 'string',
+            enum: ['every-member', 'only-admins'],
+            description: 'Who can add new members.',
+          },
+          permission_edit_details: {
+            type: 'string',
+            enum: ['every-member', 'only-admins'],
+            description: 'Who can edit name/description/avatar.',
+          },
+          permission_send_messages: {
+            type: 'string',
+            enum: ['every-member', 'only-admins'],
+            description: 'Who can send messages. only-admins is the announcement-only mode.',
+          },
         },
         required: ['group_id'],
       },
