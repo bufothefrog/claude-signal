@@ -1,6 +1,6 @@
 ---
 name: signal:configure
-description: Configure the signal-channel. Pick a Signal account, set the owner, link a new account, toggle auto-receipts/signature/profile-name/history, print a service unit.
+description: Configure the signal-channel. First-run setup walkthrough, pick a Signal account, set the owner, link a new account, toggle auto-receipts/signature/profile-name/history, print a service unit.
 user-invocable: true
 allowed-tools: Read, Write, Bash
 ---
@@ -43,16 +43,101 @@ All keys are optional. Unset behaves as the documented default. Settings take ef
 
 Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 
-### no args: status
+### no args: status (or setup walkthrough on first run)
+
+First, decide whether to show status or pivot to the setup walkthrough:
+
+- **Pivot to `setup`** if `~/.claude/channels/signal/.env` is missing or empty AND `signal-cli` is on PATH. This is the first-run path: the user just installed the plugin and there's nothing to show.
+- **Show status** otherwise (`.env` already exists, or signal-cli isn't installed yet so a walkthrough can't help).
+
+When showing status:
 
 1. Check if `signal-cli` is on PATH. If missing, say so and link to https://github.com/AsamK/signal-cli. Don't fail loudly.
 2. Run `signal-cli listAccounts` if installed. Parse the output, list account numbers.
 3. Read `~/.claude/channels/signal/.env` if it exists; show its full contents.
 4. Resolve the currently-selected account using precedence: `process.env.SIGNAL_ACCOUNT` > `.env`'s `SIGNAL_ACCOUNT` > auto (only if exactly one account is linked). Label the source.
 5. Resolve owner: `process.env.SIGNAL_OWNER` > `.env`'s `SIGNAL_OWNER` > current account.
-6. Warn if 0 linked (point at `signal:configure link`) or 2+ linked with no explicit selection (point at `signal:configure account +1...`).
+6. Warn if 0 linked (point at `signal:configure link`) or 2+ linked with no explicit selection (point at `signal:configure setup` or `signal:configure account +1...`).
 
 Show it as a plain-text status block, not JSON.
+
+### `setup`
+
+Interactive first-run walkthrough. Writes a fresh `.env` after asking the user for the bare minimum (account + owner). Always runnable explicitly to re-run the wizard.
+
+This is **conversational, not atomic**. Walk one decision at a time, wait for the user's reply, then ask the next question. Only write `.env` after the user confirms the full plan in the final step.
+
+**Step 1: account selection.**
+
+1. Run `signal-cli listAccounts`.
+2. Branch on count:
+   - **0 linked.** Stop. Tell the user no accounts are linked, point at `/signal:configure link` (existing primary phone) or signal-cli's `register` flow (headless, fresh number). Don't write `.env`.
+   - **1 linked.** Auto-pick. Say "Using +15551234567 (the only linked account)" and proceed.
+   - **2+ linked.** Present as lettered options:
+     ```
+     Which Signal account should the bridge use?
+       [a] +15551234567
+       [b] +15559876543
+       [c] enter a different number manually
+     Reply with a letter (or just type the number).
+     ```
+     On `c` or a typed number: validate against `^\+\d{7,15}$`. Re-prompt on invalid.
+
+**Step 2: owner selection.**
+
+The owner is the Signal account that gets DMed when Claude needs to authorize a sensitive tool call (Bash, Write, etc). The implicit fallback is the bridge account itself, which is a black hole — permission prompts go to the bridge and nobody sees them. Always ask explicitly.
+
+```
+Who should be the permission-relay owner? This is the Signal account
+that gets DMed when Claude needs to authorize a sensitive tool call.
+Set this to your own phone, separate from the bridge.
+  [a] Enter a phone number (+1...)
+  [b] Enter a UUID (8-4-4-4-12 hex)
+  [c] Same as bridge (<bridge>). NOT RECOMMENDED. Prompts go nowhere visible.
+  [d] Skip. You can set this later with /signal:configure owner <id>.
+```
+
+On `a`: ask for the number, validate `^\+\d{7,15}$`, re-prompt on invalid.
+On `b`: ask for the UUID, validate `^[0-9a-f-]{36}$`, re-prompt on invalid.
+On `c`: warn once that prompts will be invisible, then accept if user confirms.
+On `d`: skip writing `SIGNAL_OWNER`.
+
+**Step 3: confirm.**
+
+Echo what's about to be written, prompt for confirmation:
+
+```
+About to save to ~/.claude/channels/signal/.env:
+  SIGNAL_ACCOUNT=+15551234567
+  SIGNAL_OWNER=+15559999999
+Proceed? [y/n]
+```
+
+On `y`: `mkdir -p ~/.claude/channels/signal`, atomic write at 0600 (same shape as `account <number>` / `owner <number>`). Preserve any existing keys if `.env` happened to exist with unrelated content.
+On `n`: discard, tell the user nothing was written, exit.
+
+**Step 4: next steps.**
+
+After a successful write:
+
+```
+Saved. Restart your Claude Code session for the bridge to pick this up.
+
+Optional next steps (each takes effect on the next restart):
+  /signal:configure profile-name <name>     display name shown to recipients
+  /signal:configure auto-receipts on        auto-ack inbound messages
+  /signal:configure signature on            append "via Claude" footer to outbound
+  /signal:configure history off             disable SQLite message history
+  /signal:configure service                 print a starter systemd user unit
+```
+
+**Walkthrough implementation notes:**
+
+- One continuous conversation. Don't treat each step as a fresh skill invocation; the user replies to your prompt, you parse, you ask next.
+- Never auto-fill OWNER from the bridge account silently. The default fallback is a known trap.
+- If the user types something unparseable (a slash command, gibberish, an answer to a different question), gracefully bail with "I lost track. Re-run `/signal:configure setup` to start over." Don't try to recover mid-conversation.
+- Don't ask about optional toggles in the wizard. Friction adds up. Surface them as the next-steps list at the end and let the user pick what they want.
+- If `.env` already has either `SIGNAL_ACCOUNT` or `SIGNAL_OWNER`, the wizard should still run (re-running is the explicit-invocation use case) but pre-fill the existing values as the default option in each step, e.g. `[a] keep current: +15551234567`.
 
 ### `account <number>`
 
