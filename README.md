@@ -109,8 +109,10 @@ Add the marketplace, install the plugin:
 Then relaunch Claude Code with the channels flag:
 
 ```sh
-claude --channels plugin:signal@claude-signal
+claude --dangerously-load-development-channels plugin:signal@claude-signal
 ```
+
+The scary-sounding flag is required because Claude Code's channel surface is still pre-GA; every channel plugin loads behind it for now, not just this one.
 
 If exactly one signal-cli account is linked, the bridge auto-detects it. If multiple are linked, point it at the one you want:
 

@@ -237,7 +237,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h
-ExecStart=/bin/sh -lc 'claude --channels plugin:signal@claude-signal'
+ExecStart=/bin/sh -lc 'claude --dangerously-load-development-channels plugin:signal@claude-signal'
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
