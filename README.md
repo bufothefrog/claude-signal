@@ -144,6 +144,8 @@ DMs and groups have independent policies (`dmPolicy`, `groupPolicy`), each with 
 
 Run `/signal:access` to inspect current state.
 
+**Hardening note.** All mutations to `access.json` route through a bundled deterministic dispatcher at `bin/signal-access` (auto-PATH'd when the plugin is enabled). The `/signal:access` skill is locked down via `allowed-tools: Bash(signal-access:*)` so it cannot construct ad-hoc bash to touch the file directly. A prompt-injected Claude can only invoke the dispatcher with whatever args; it cannot bypass the dispatcher's own validation. Defense in depth against channel-borne instructions trying to coerce access-state changes.
+
 ## Tools
 
 | Tool | Purpose |

@@ -1,0 +1,440 @@
+#!/usr/bin/env bun
+/**
+ * signal-access — deterministic access.json mutator
+ *
+ * Bundled dispatcher invoked by the /signal:access skill. All access-state
+ * mutations route through this script so the skill (and Claude) cannot
+ * generate arbitrary bash; defense in depth against prompt-injection-coerced
+ * mutations. Every subcommand validates its inputs in code, holds a mkdir-
+ * based lockdir during read-modify-write, and atomically writes JSON in the
+ * format saveAccess() uses (server.ts:199-205).
+ *
+ * Refuses writes when SIGNAL_ACCESS_MODE=static, matching server.ts:200.
+ * Reads SIGNAL_ACCESS_MODE from process.env only — NOT from STATE_DIR/.env —
+ * mirroring the bridge's gate at server.ts:47.
+ */
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmdirSync,
+  writeFileSync,
+} from 'node:fs'
+
+// --- types (mirror server.ts:112-135) ----------------------------------------
+
+type PendingEntry = {
+  kind: 'dm' | 'group'
+  senderId: string
+  chatId: string
+  createdAt: number
+  expiresAt: number
+  replies: number
+}
+
+type GroupPolicy = {
+  requireMention: boolean
+  allowFrom: string[]
+}
+
+type Access = {
+  dmPolicy: 'pairing' | 'allowlist' | 'disabled'
+  groupPolicy: 'pairing' | 'allowlist' | 'disabled'
+  allowFrom: string[]
+  groups: Record<string, GroupPolicy>
+  pending: Record<string, PendingEntry>
+  mentionPatterns?: string[]
+  textChunkLimit?: number
+  chunkMode?: 'length' | 'newline'
+}
+
+type Policy = 'pairing' | 'allowlist' | 'disabled'
+
+// --- paths -------------------------------------------------------------------
+
+const STATE_DIR =
+  process.env.SIGNAL_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'signal')
+const ACCESS_FILE = join(STATE_DIR, 'access.json')
+const APPROVED_DIR = join(STATE_DIR, 'approved')
+const LOCK_DIR = join(STATE_DIR, 'access.json.lockdir')
+
+// --- helpers -----------------------------------------------------------------
+
+// die() throws rather than calling process.exit() directly so that any
+// in-flight `finally` blocks (notably withLock's lockdir cleanup) still run.
+// The top-level dispatch catches AccessError, prints, and exits non-zero.
+class AccessError extends Error {}
+
+function die(msg: string): never {
+  throw new AccessError(msg)
+}
+
+function defaultAccess(): Access {
+  return {
+    dmPolicy: 'pairing',
+    groupPolicy: 'pairing',
+    allowFrom: [],
+    groups: {},
+    pending: {},
+  }
+}
+
+function readAccess(): Access {
+  if (!existsSync(ACCESS_FILE)) return defaultAccess()
+  let raw: string
+  try {
+    raw = readFileSync(ACCESS_FILE, 'utf8')
+  } catch (err) {
+    die(`failed to read ${ACCESS_FILE}: ${(err as Error).message}`)
+  }
+  let parsed: Partial<Access>
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    die(
+      `${ACCESS_FILE} is not valid JSON; refusing to clobber. ` +
+      `Move it aside or fix it manually before retrying.`,
+    )
+  }
+  // Mirror server.ts:151-154 — legacy entries default to kind='dm'.
+  const pending: Record<string, PendingEntry> = {}
+  for (const [code, entry] of Object.entries(parsed.pending ?? {})) {
+    pending[code] = { kind: 'dm', ...(entry as PendingEntry) }
+  }
+  return {
+    dmPolicy: parsed.dmPolicy ?? 'pairing',
+    groupPolicy: parsed.groupPolicy ?? 'pairing',
+    allowFrom: parsed.allowFrom ?? [],
+    groups: parsed.groups ?? {},
+    pending,
+    mentionPatterns: parsed.mentionPatterns,
+    textChunkLimit: parsed.textChunkLimit,
+    chunkMode: parsed.chunkMode,
+  }
+}
+
+function writeAccess(a: Access): void {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+  // Unique tmp name so we don't collide with the bridge's fixed `<file>.tmp`
+  // at server.ts:202 if both happen to write at the same moment.
+  const tmp = `${ACCESS_FILE}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 8)}`
+  writeFileSync(tmp, JSON.stringify(a, null, 2) + '\n', { mode: 0o600 })
+  renameSync(tmp, ACCESS_FILE)
+}
+
+function withLock<T>(fn: () => T): T {
+  // mkdir is atomic across all platforms; cheaper and more portable than
+  // flock. Held only across one read-modify-write cycle. The bridge does
+  // NOT take this lock — bridge writes from a single event loop don't need
+  // one — so a residual race with bridge writes still exists. The window is
+  // microseconds and matches the pre-existing bridge race surface.
+  let acquired = false
+  for (let i = 0; i < 50; i++) {
+    try {
+      mkdirSync(LOCK_DIR, { recursive: false })
+      acquired = true
+      break
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+      Bun.sleepSync(20)
+    }
+  }
+  if (!acquired) die(`another signal-access invocation holds ${LOCK_DIR}; retry`)
+  try {
+    return fn()
+  } finally {
+    try {
+      rmdirSync(LOCK_DIR)
+    } catch {}
+  }
+}
+
+function checkStatic(): void {
+  if (process.env.SIGNAL_ACCESS_MODE === 'static') {
+    die('SIGNAL_ACCESS_MODE=static; refusing to write')
+  }
+}
+
+// --- arg validators ----------------------------------------------------------
+
+const CODE_RE = /^[0-9a-f]{6}$/
+
+function expectCode(code: string | undefined, where: string): string {
+  if (!code) die(`${where} requires a 6-char hex code`)
+  const lower = code.toLowerCase()
+  if (!CODE_RE.test(lower)) {
+    die(`invalid code ${code}; expected 6 hex chars (matches randomBytes(3).toString('hex'))`)
+  }
+  return lower
+}
+
+function expectPolicy(p: string | undefined): Policy {
+  if (p === 'pairing' || p === 'allowlist' || p === 'disabled') return p
+  die(`policy must be pairing|allowlist|disabled (got ${p ?? '(missing)'})`)
+}
+
+function expectArg(value: string | undefined, where: string): string {
+  if (!value) die(`${where} requires an argument`)
+  return value
+}
+
+// --- subcommand handlers -----------------------------------------------------
+
+function cmdPair(args: string[]): void {
+  const code = expectCode(args[0], 'pair')
+  checkStatic()
+  withLock(() => {
+    const a = readAccess()
+    const entry = a.pending[code]
+    if (!entry) die(`no pending entry for code ${code}`)
+    if (entry.expiresAt < Date.now()) {
+      delete a.pending[code]
+      writeAccess(a)
+      die(`code ${code} expired`)
+    }
+    if (entry.kind !== 'dm') {
+      die(`code ${code} is a group pairing; use: signal-access group pair ${code}`)
+    }
+    if (!a.allowFrom.includes(entry.senderId)) a.allowFrom.push(entry.senderId)
+    delete a.pending[code]
+    writeAccess(a)
+
+    // Write approved/<senderId> AFTER the access.json rename so the bridge
+    // poller (server.ts:1761) sees allowFrom updated before sending "Paired!".
+    mkdirSync(APPROVED_DIR, { recursive: true, mode: 0o700 })
+    writeFileSync(join(APPROVED_DIR, entry.senderId), entry.chatId, { mode: 0o600 })
+
+    process.stdout.write(
+      `paired sender=${entry.senderId} chat=${entry.chatId}; bridge will send "Paired!" within ~5s\n`,
+    )
+  })
+}
+
+function cmdDeny(args: string[]): void {
+  const code = expectCode(args[0], 'deny')
+  checkStatic()
+  withLock(() => {
+    const a = readAccess()
+    const entry = a.pending[code]
+    if (!entry) die(`no pending entry for code ${code}`)
+    if (entry.kind !== 'dm') {
+      die(`code ${code} is a group pairing; use: signal-access group deny ${code}`)
+    }
+    delete a.pending[code]
+    writeAccess(a)
+    process.stdout.write(`denied code=${code} (no message sent to sender)\n`)
+  })
+}
+
+function cmdAllow(args: string[]): void {
+  const senderId = expectArg(args[0], 'allow')
+  checkStatic()
+  withLock(() => {
+    const a = readAccess()
+    if (!a.allowFrom.includes(senderId)) a.allowFrom.push(senderId)
+    writeAccess(a)
+    process.stdout.write(`allowed sender=${senderId}\n`)
+  })
+}
+
+function cmdRemove(args: string[]): void {
+  const senderId = expectArg(args[0], 'remove')
+  checkStatic()
+  withLock(() => {
+    const a = readAccess()
+    a.allowFrom = a.allowFrom.filter(id => id !== senderId)
+    writeAccess(a)
+    process.stdout.write(`removed sender=${senderId}\n`)
+  })
+}
+
+function cmdPolicy(args: string[]): void {
+  const policy = expectPolicy(args[0])
+  checkStatic()
+  withLock(() => {
+    const a = readAccess()
+    a.dmPolicy = policy
+    writeAccess(a)
+    process.stdout.write(`dmPolicy=${policy}\n`)
+  })
+}
+
+function cmdSet(args: string[]): void {
+  const key = expectArg(args[0], 'set')
+  const value = args.slice(1).join(' ')
+  checkStatic()
+  withLock(() => {
+    const a = readAccess()
+    switch (key) {
+      case 'mentionPatterns': {
+        const patterns = value.split(',').map(s => s.trim()).filter(Boolean)
+        a.mentionPatterns = patterns
+        break
+      }
+      case 'textChunkLimit': {
+        const n = Number(value)
+        if (!Number.isInteger(n) || n < 0 || n > 10000) {
+          die('textChunkLimit must be an integer 0..10000')
+        }
+        a.textChunkLimit = n
+        break
+      }
+      case 'chunkMode': {
+        if (value !== 'newline' && value !== 'length') {
+          die('chunkMode must be newline or length')
+        }
+        a.chunkMode = value
+        break
+      }
+      default:
+        die(`unknown key ${key}; supported: mentionPatterns, textChunkLimit, chunkMode`)
+    }
+    writeAccess(a)
+    process.stdout.write(`set ${key}=${value}\n`)
+  })
+}
+
+function cmdGroupPair(args: string[]): void {
+  const code = expectCode(args[0], 'group pair')
+  checkStatic()
+  withLock(() => {
+    const a = readAccess()
+    const entry = a.pending[code]
+    if (!entry) die(`no pending entry for code ${code}`)
+    if (entry.expiresAt < Date.now()) {
+      delete a.pending[code]
+      writeAccess(a)
+      die(`code ${code} expired`)
+    }
+    if (entry.kind !== 'group') {
+      die(`code ${code} is a DM pairing; use: signal-access pair ${code}`)
+    }
+    a.groups[entry.chatId] = { requireMention: true, allowFrom: [] }
+    delete a.pending[code]
+    writeAccess(a)
+    process.stdout.write(
+      `group paired chat=${entry.chatId}; bridge will route group traffic on next inbound\n`,
+    )
+  })
+}
+
+function cmdGroupDeny(args: string[]): void {
+  const code = expectCode(args[0], 'group deny')
+  checkStatic()
+  withLock(() => {
+    const a = readAccess()
+    const entry = a.pending[code]
+    if (!entry) die(`no pending entry for code ${code}`)
+    if (entry.kind !== 'group') {
+      die(`code ${code} is a DM pairing; use: signal-access deny ${code}`)
+    }
+    delete a.pending[code]
+    writeAccess(a)
+    process.stdout.write(`group denied code=${code}\n`)
+  })
+}
+
+function cmdGroupAdd(args: string[]): void {
+  const chatId = expectArg(args[0], 'group add')
+  let requireMention = true
+  let allowFromList: string[] = []
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i]
+    if (arg === '--no-mention') {
+      requireMention = false
+    } else if (arg === '--allow') {
+      const csv = args[++i]
+      if (!csv) die('--allow requires a comma-separated UUID list')
+      allowFromList = csv.split(',').map(s => s.trim()).filter(Boolean)
+    } else if (arg.startsWith('--allow=') || arg.startsWith('--no-mention=')) {
+      die(`use space-separated form: ${arg.split('=')[0]} <value>`)
+    } else {
+      die(`unknown arg ${arg}; supported: --no-mention, --allow uuid1,uuid2`)
+    }
+  }
+  checkStatic()
+  withLock(() => {
+    const a = readAccess()
+    a.groups[chatId] = { requireMention, allowFrom: allowFromList }
+    writeAccess(a)
+    process.stdout.write(
+      `group added chat=${chatId} requireMention=${requireMention} allowFrom=[${allowFromList.join(',')}]\n`,
+    )
+  })
+}
+
+function cmdGroupRm(args: string[]): void {
+  const chatId = expectArg(args[0], 'group rm')
+  checkStatic()
+  withLock(() => {
+    const a = readAccess()
+    delete a.groups[chatId]
+    writeAccess(a)
+    process.stdout.write(`group removed chat=${chatId}\n`)
+  })
+}
+
+function cmdGroupPolicy(args: string[]): void {
+  const policy = expectPolicy(args[0])
+  checkStatic()
+  withLock(() => {
+    const a = readAccess()
+    a.groupPolicy = policy
+    writeAccess(a)
+    process.stdout.write(`groupPolicy=${policy}\n`)
+  })
+}
+
+// --- dispatch ----------------------------------------------------------------
+
+function dispatch(argv: string[]): void {
+  const [sub, ...rest] = argv
+  switch (sub) {
+    case 'pair':       cmdPair(rest); break
+    case 'deny':       cmdDeny(rest); break
+    case 'allow':      cmdAllow(rest); break
+    case 'remove':     cmdRemove(rest); break
+    case 'policy':     cmdPolicy(rest); break
+    case 'set':        cmdSet(rest); break
+    case 'group': {
+      const [g, ...gRest] = rest
+      switch (g) {
+        case 'pair':   cmdGroupPair(gRest); break
+        case 'deny':   cmdGroupDeny(gRest); break
+        case 'add':    cmdGroupAdd(gRest); break
+        case 'rm':     cmdGroupRm(gRest); break
+        case 'policy': cmdGroupPolicy(gRest); break
+        default:       die(`unknown subcommand: group ${g ?? '(missing)'}`)
+      }
+      break
+    }
+    default:
+      die(
+        `usage: signal-access <subcommand> [args]\n` +
+        `  pair <code>                            DM pair\n` +
+        `  deny <code>                            DM deny\n` +
+        `  allow <senderId>                       add to allowFrom directly\n` +
+        `  remove <senderId>                      remove from allowFrom\n` +
+        `  policy <pairing|allowlist|disabled>    set dmPolicy\n` +
+        `  set <key> <value>                      set mentionPatterns | textChunkLimit | chunkMode\n` +
+        `  group pair <code>                      group pair\n` +
+        `  group deny <code>                      group deny\n` +
+        `  group add <chat_id> [--no-mention] [--allow uuid1,uuid2]\n` +
+        `  group rm <chat_id>                     remove a group\n` +
+        `  group policy <pairing|allowlist|disabled>  set groupPolicy`,
+      )
+  }
+}
+
+try {
+  dispatch(process.argv.slice(2))
+} catch (err) {
+  if (err instanceof AccessError) {
+    process.stderr.write(`signal-access: ${err.message}\n`)
+    process.exit(1)
+  }
+  throw err
+}
