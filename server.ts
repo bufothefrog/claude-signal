@@ -28,6 +28,7 @@ import {
   rmSync,
   renameSync,
   realpathSync,
+  statSync,
 } from 'fs'
 import { homedir, userInfo } from 'os'
 import { join, sep } from 'path'
@@ -43,6 +44,9 @@ const APPROVED_DIR = join(STATE_DIR, 'approved')
 const PROFILE_MARKER = join(STATE_DIR, '.profile-set')
 const MESSAGES_DB = join(STATE_DIR, 'messages.db')
 const AUTHORS_FILE = join(STATE_DIR, 'authors.json')
+const HB_START = join(STATE_DIR, 'tool-start.heartbeat')
+const HB_END = join(STATE_DIR, 'tool-end.heartbeat')
+const RUNTIME_STATUS = join(STATE_DIR, 'runtime-status.json')
 
 const STATIC = process.env.SIGNAL_ACCESS_MODE === 'static'
 const APPEND_SIGNATURE = process.env.SIGNAL_APPEND_SIGNATURE === 'true'
@@ -93,8 +97,37 @@ const SIGNAL_CONFIG =
   process.env.SIGNAL_CLI_CONFIG ??
   envFile.SIGNAL_CLI_CONFIG ??
   join(homedir(), '.local', 'share', 'signal-cli')
-const AUTO_READ_RECEIPTS =
-  (process.env.SIGNAL_AUTO_READ_RECEIPTS ?? envFile.SIGNAL_AUTO_READ_RECEIPTS) === 'true'
+// Tri-state. v1.4 BREAKING: legacy `=true` now parses to `=deferred` (was
+// `=eager` in v1.3). To keep v1.3 immediate-on-ingestion, set `=eager`.
+type AutoReadMode = 'off' | 'eager' | 'deferred'
+function parseAutoReadMode(raw: string | undefined): AutoReadMode {
+  switch ((raw ?? '').toLowerCase()) {
+    case 'eager':
+      return 'eager'
+    case 'deferred':
+    case 'true':
+      return 'deferred'
+    case '':
+    case 'false':
+    case 'off':
+      return 'off'
+    default:
+      process.stderr.write(
+        `signal channel: unrecognized SIGNAL_AUTO_READ_RECEIPTS=${raw}, treating as off\n`,
+      )
+      return 'off'
+  }
+}
+const AUTO_READ_RECEIPTS: AutoReadMode = parseAutoReadMode(
+  process.env.SIGNAL_AUTO_READ_RECEIPTS ?? envFile.SIGNAL_AUTO_READ_RECEIPTS,
+)
+// Hook-driven typing indicator. Refreshes every 10s while a Claude tool is
+// in flight (Pre/Post hooks bracket the heartbeats); decays naturally via
+// signal-cli's ~15s timeout when out. Requires `/signal:configure typing on`
+// to install the hooks; `driftCheck()` warns at boot if env says on but
+// the hooks are missing.
+const SIGNAL_TYPING =
+  (process.env.SIGNAL_TYPING ?? envFile.SIGNAL_TYPING) === 'true'
 // Opt-out for the SQLite message-history database. When true, the bridge skips
 // initializing messages.db, recordSent/recordReceived become no-ops, and the
 // chat_messages/react/mark_read tools throw a clear "history disabled" error.
@@ -106,6 +139,21 @@ const DISABLE_HISTORY =
 // Resolved at startup, before mcp.connect, after listAccounts.
 let currentAccount = ''
 let OWNER = ''
+
+// Engagement signals: which chat last relayed an inbound to a Claude session,
+// and when. Drives typing target + 5min staleness window. Cleared on
+// reply/edit_message success and on typing(stop=true). Own-message echo
+// guarded at relay sites.
+let lastRelayedChatId: string | null = null
+let lastRelayedAt = 0
+
+// Deferred read-receipts queue. Populated when AUTO_READ_RECEIPTS=='deferred'
+// at inbound time, drained on first tool engagement (heartbeat freshness in
+// pollHeartbeat) or inline in signal-channel tool cases. Atomic snapshot-and-
+// clear during drain; re-queued on RPC failure.
+const pendingReads: Map<string, { senderId: string; ts: number }[]> = new Map()
+const PENDING_READ_TTL_MS = 6 * 60 * 60 * 1000
+let RECEIPT_TTL_DROPPED_TOTAL = 0
 
 // --- access state ------------------------------------------------------------
 
@@ -1305,6 +1353,117 @@ function chunkText(text: string, limit: number, mode: 'length' | 'newline'): str
   return out
 }
 
+// --- typing + deferred receipts ----------------------------------------------
+
+function mtimeOrZero(path: string): number {
+  try {
+    return statSync(path).mtimeMs
+  } catch {
+    return 0
+  }
+}
+
+function enqueuePendingRead(chatId: string, senderId: string, ts: number): void {
+  const cutoff = Date.now() - PENDING_READ_TTL_MS
+  const existing = pendingReads.get(chatId) ?? []
+  const pruned = existing.filter(e => e.ts >= cutoff)
+  pruned.push({ senderId, ts })
+  pendingReads.set(chatId, pruned)
+}
+
+// Inner helper: drain a snapshot of one chat's entries. Stale entries dropped
+// silently (counter incremented). RPC failure re-queues the failed sender's
+// timestamps onto the live queue for eventual retry.
+async function drainEntries(
+  chatId: string,
+  entries: { senderId: string; ts: number }[],
+): Promise<void> {
+  const cutoff = Date.now() - PENDING_READ_TTL_MS
+  const fresh = entries.filter(e => e.ts >= cutoff)
+  const dropped = entries.length - fresh.length
+  if (dropped > 0) {
+    RECEIPT_TTL_DROPPED_TOTAL += dropped
+    process.stderr.write(
+      `signal channel: dropped ${dropped} stale receipt(s) (>6h) for ${chatId}\n`,
+    )
+  }
+  if (fresh.length === 0) return
+  const bySender = new Map<string, number[]>()
+  for (const e of fresh) {
+    const list = bySender.get(e.senderId) ?? []
+    list.push(e.ts)
+    bySender.set(e.senderId, list)
+  }
+  for (const [senderId, timestamps] of bySender) {
+    try {
+      await rpc('sendReceipt', {
+        recipient: senderId,
+        type: 'read',
+        targetTimestamp: timestamps,
+      })
+    } catch (err) {
+      process.stderr.write(
+        `signal channel: deferred receipt failed for ${senderId} in ${chatId}: ${err}\n`,
+      )
+      const requeued = pendingReads.get(chatId) ?? []
+      for (const ts of timestamps) requeued.push({ senderId, ts })
+      pendingReads.set(chatId, requeued)
+    }
+  }
+}
+
+// Atomic snapshot+clear of all queues, then drain. Concurrent drains find an
+// empty map and no-op; in-flight inbound enqueues during await go to a fresh
+// queue and get caught on the next drain.
+async function drainPendingReads(): Promise<void> {
+  if (pendingReads.size === 0) return
+  const snapshot = [...pendingReads.entries()]
+  pendingReads.clear()
+  for (const [chatId, entries] of snapshot) {
+    await drainEntries(chatId, entries)
+  }
+}
+
+// Inline drain for tool cases that engage with a single chat. Same atomic
+// pattern, scoped to one chatId.
+async function drainPendingForChat(chatId: string): Promise<void> {
+  const entries = pendingReads.get(chatId)
+  if (!entries?.length) return
+  pendingReads.delete(chatId)
+  await drainEntries(chatId, entries)
+}
+
+// Linear scan across all queues to remove a single timestamp. mark_read
+// doesn't take chat_id, so we can't index by key. Fine since queues are small.
+function removePendingByTimestamp(ts: number): void {
+  for (const [chatId, entries] of pendingReads) {
+    const filtered = entries.filter(e => e.ts !== ts)
+    if (filtered.length === entries.length) continue
+    if (filtered.length === 0) pendingReads.delete(chatId)
+    else pendingReads.set(chatId, filtered)
+  }
+}
+
+// Runtime status snapshot for the /signal:status skill. Cheap atomic write
+// every poll tick; staleness is the freshness signal status uses.
+function writeRuntimeStatus(): void {
+  let pendingTotal = 0
+  for (const entries of pendingReads.values()) pendingTotal += entries.length
+  const snapshot = {
+    pendingChats: pendingReads.size,
+    pendingTotal,
+    ttlDropped: RECEIPT_TTL_DROPPED_TOTAL,
+    lastPollAt: Date.now(),
+  }
+  const tmp = `${RUNTIME_STATUS}.tmp`
+  try {
+    writeFileSync(tmp, JSON.stringify(snapshot), { mode: 0o644 })
+    renameSync(tmp, RUNTIME_STATUS)
+  } catch (err) {
+    process.stderr.write(`signal channel: runtime-status write failed: ${err}\n`)
+  }
+}
+
 async function sendChunked(chatId: string, text: string): Promise<number> {
   const access = loadAccess()
   const limit = Math.max(1, access.textChunkLimit ?? 2000)
@@ -1333,6 +1492,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const files = (args.files as string[] | undefined) ?? []
         for (const f of files) assertSendable(f)
 
+        void drainPendingForChat(chatId).catch(err =>
+          process.stderr.write(`signal channel: inline drain failed: ${err}\n`),
+        )
+
         // If we have files OR a quote, take the explicit single-send path
         // (chunking with attachments would split attachment off the text).
         if (files.length > 0 || args.reply_to) {
@@ -1350,15 +1513,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           const result = (await rpc('send', params)) as { timestamp?: number }
           const ts = result?.timestamp ?? Date.now()
           recordSent(chatId, finalText, ts, files.length > 0 ? files[0] : undefined)
+          if (lastRelayedChatId === chatId) lastRelayedChatId = null
           return { content: [{ type: 'text', text: `sent (${ts})` }] }
         }
 
         const ts = await sendChunked(chatId, text)
+        if (lastRelayedChatId === chatId) lastRelayedChatId = null
         return { content: [{ type: 'text', text: `sent (${ts})` }] }
       }
       case 'edit_message': {
         const chatId = args.chat_id as string
         const finalText = APPEND_SIGNATURE ? args.text + SIGNATURE : args.text
+        void drainPendingForChat(chatId).catch(err =>
+          process.stderr.write(`signal channel: inline drain failed: ${err}\n`),
+        )
         const params: Record<string, unknown> = {
           ...recipientParams(chatId),
           editTimestamp: Number(args.message_id),
@@ -1367,6 +1535,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const result = (await rpc('send', params)) as { timestamp?: number }
         const ts = result?.timestamp ?? Date.now()
         recordSent(chatId, finalText, ts, undefined, Number(args.message_id))
+        if (lastRelayedChatId === chatId) lastRelayedChatId = null
         return { content: [{ type: 'text', text: `edited (${ts})` }] }
       }
       case 'react': {
@@ -1374,6 +1543,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chatId = args.chat_id as string
         const messageId = args.message_id as string
         const emoji = args.emoji as string
+        void drainPendingForChat(chatId).catch(err =>
+          process.stderr.write(`signal channel: inline drain failed: ${err}\n`),
+        )
         const author = authorByMessageId(messageId)
         if (!author) {
           throw new Error(
@@ -1394,11 +1566,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'typing': {
         const chatId = args.chat_id as string
         const stop = !!args.stop
+        void drainPendingForChat(chatId).catch(err =>
+          process.stderr.write(`signal channel: inline drain failed: ${err}\n`),
+        )
         const params: Record<string, unknown> = {
           ...recipientParams(chatId),
           stop,
         }
         await rpc('sendTyping', params)
+        if (stop && lastRelayedChatId === chatId) lastRelayedChatId = null
         return { content: [{ type: 'text', text: stop ? 'stopped' : 'typing' }] }
       }
       case 'chat_messages': {
@@ -1482,6 +1658,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             `cannot mark_read: no inbound row for message_id ${messageId}.`,
           )
         }
+        // Dedupe against the deferred queue: if this timestamp is queued for
+        // a future drain, drop it now so we don't double-ack the same message.
+        removePendingByTimestamp(Number(messageId))
         // sendReceipt's CLI definition has `recipient` as a single positional
         // (no nargs), unlike `send` which is multi-recipient. Wrapping in an
         // array errors with "Failed to send message".
@@ -1490,6 +1669,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           type: 'read',
           targetTimestamp: [Number(messageId)],
         })
+        // Explicit mark_read is a strong engagement signal — flush any other
+        // queued reads while we're at it.
+        void drainPendingReads().catch(err =>
+          process.stderr.write(`signal channel: drain after mark_read failed: ${err}\n`),
+        )
         return { content: [{ type: 'text', text: `marked read (${messageId})` }] }
       }
       case 'list_identities': {
@@ -1889,19 +2073,25 @@ function onEnvelope(env: SignalEnvelope) {
     )
 
     // Auto-read-receipts: skip our own outbound (syncMessage) and edits (the
-    // edited target was already acked when first seen).
+    // edited target was already acked when first seen). 'eager' fires
+    // immediately (legacy v1.3 behavior); 'deferred' queues for drain on
+    // first Claude engagement (v1.4 default for `=true`).
     if (
-      AUTO_READ_RECEIPTS &&
+      AUTO_READ_RECEIPTS !== 'off' &&
       senderId !== currentAccount &&
       !env.editMessage
     ) {
-      rpc('sendReceipt', {
-        recipient: senderId,
-        type: 'read',
-        targetTimestamp: [env.timestamp],
-      }).catch(err =>
-        process.stderr.write(`signal channel: auto-receipt failed: ${err}\n`),
-      )
+      if (AUTO_READ_RECEIPTS === 'eager') {
+        rpc('sendReceipt', {
+          recipient: senderId,
+          type: 'read',
+          targetTimestamp: [env.timestamp],
+        }).catch(err =>
+          process.stderr.write(`signal channel: auto-receipt failed: ${err}\n`),
+        )
+      } else {
+        enqueuePendingRead(chatId, senderId, env.timestamp)
+      }
     }
   }
 
@@ -1918,6 +2108,10 @@ function onEnvelope(env: SignalEnvelope) {
     const targetAuthor =
       reaction.targetAuthorUuid ?? reaction.targetAuthorNumber ?? ta ?? 'unknown'
     const isRemove = reaction.isRemove === true
+    if (senderId && senderId !== currentAccount) {
+      lastRelayedChatId = chatId
+      lastRelayedAt = Date.now()
+    }
     void mcp.notification({
       method: 'notifications/claude/channel',
       params: {
@@ -1966,6 +2160,10 @@ function onEnvelope(env: SignalEnvelope) {
     return
   }
 
+  if (senderId && senderId !== currentAccount) {
+    lastRelayedChatId = chatId
+    lastRelayedAt = Date.now()
+  }
   void mcp.notification({
     method: 'notifications/claude/channel',
     params: {
@@ -1981,6 +2179,93 @@ function onEnvelope(env: SignalEnvelope) {
       },
     },
   })
+}
+
+// --- engagement poll loop ----------------------------------------------------
+
+// Runs once at boot. Verifies that env-var feature flags are backed by the
+// matching Claude Code hook entries in ~/.claude/settings.json. If a feature
+// is enabled but its hook is missing, the user gets a multi-line stderr
+// block explaining the exact /signal:configure command to run. Substring
+// match is used (not full JSON parse) so malformed JSON still gets sensible
+// warnings.
+function driftCheck(): void {
+  const settingsPath = join(homedir(), '.claude', 'settings.json')
+  let raw = ''
+  try {
+    raw = readFileSync(settingsPath, 'utf8')
+  } catch {
+    // Missing settings.json → treated as "no hooks installed". The drift
+    // checks below will fire if any feature is on.
+  }
+  // Try a structured parse for diagnostics; we don't need the result —
+  // substring match is the canonical check.
+  try {
+    if (raw) JSON.parse(raw)
+  } catch {
+    process.stderr.write(
+      `signal channel: ${settingsPath} unparseable, drift check using substring match\n`,
+    )
+  }
+  const hasStart = raw.includes('signal/tool-start.heartbeat')
+  const hasEnd = raw.includes('signal/tool-end.heartbeat')
+
+  if (SIGNAL_TYPING && !(hasStart && hasEnd)) {
+    process.stderr.write(
+      `\n[CONFIG DRIFT] SIGNAL_TYPING=true but PreToolUse/PostToolUse hooks for\n` +
+        `typing are missing from ~/.claude/settings.json. Typing indicators\n` +
+        `will not fire. Run: /signal:configure typing on\n\n`,
+    )
+  }
+  if (AUTO_READ_RECEIPTS === 'deferred' && !hasStart) {
+    process.stderr.write(
+      `\n[CONFIG DRIFT] SIGNAL_AUTO_READ_RECEIPTS=deferred but no PreToolUse hook\n` +
+        `touching tool-start.heartbeat in ~/.claude/settings.json. Inbound\n` +
+        `messages will queue without ever draining (until restart wipes the\n` +
+        `in-memory queue). Run: /signal:configure auto-receipts deferred\n\n`,
+    )
+  }
+}
+
+// Runs every 10s. Reads heartbeat mtimes (touched by Pre/PostToolUse hooks)
+// and gates two independent features:
+//   - Read-receipt drain: any tool engagement in the last 15s drains all
+//     pendingReads. Drives "first read by Claude" semantics.
+//   - Typing refresh: a tool is currently in flight (start > end), and the
+//     last relay was within 5min, and SIGNAL_TYPING is on.
+// Static mode skips both mutation paths but keeps writing runtime-status so
+// /signal:status reflects bridge liveness.
+function pollHeartbeat(): void {
+  const now = Date.now()
+  const startMtime = mtimeOrZero(HB_START)
+  const endMtime = mtimeOrZero(HB_END)
+
+  if (!STATIC) {
+    if (
+      AUTO_READ_RECEIPTS === 'deferred' &&
+      now - Math.max(startMtime, endMtime) < 15_000
+    ) {
+      void drainPendingReads().catch(err =>
+        process.stderr.write(`signal channel: drain failed: ${err}\n`),
+      )
+    }
+
+    if (
+      SIGNAL_TYPING &&
+      startMtime > endMtime &&
+      lastRelayedChatId &&
+      now - lastRelayedAt < 5 * 60_000
+    ) {
+      rpc('sendTyping', {
+        ...recipientParams(lastRelayedChatId),
+        stop: false,
+      }).catch(err =>
+        process.stderr.write(`signal channel: typing refresh failed: ${err}\n`),
+      )
+    }
+  }
+
+  writeRuntimeStatus()
 }
 
 // --- approved/ poller --------------------------------------------------------
@@ -2260,6 +2545,8 @@ cleanupStaleBridges()
 currentAccount = resolveAccount()
 OWNER = process.env.SIGNAL_OWNER ?? envFile.SIGNAL_OWNER ?? currentAccount
 
+driftCheck()
+
 spawnSignalCli()
 
 // Auto-set profile name on first boot. signal-cli has no command to read own
@@ -2290,6 +2577,9 @@ if (PROFILE_NAME) {
 }
 
 if (!STATIC) setInterval(checkApprovals, 5000).unref()
+// Always-on; pollHeartbeat gates its mutation paths on !STATIC internally and
+// writes runtime-status.json regardless so /signal:status sees liveness.
+setInterval(pollHeartbeat, 10_000).unref()
 
 // Claude Code closes our stdio transport on /exit. Without these hooks the
 // bridge keeps running and holds the signal-cli account lockfile, blocking

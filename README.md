@@ -201,13 +201,41 @@ Inbound and outbound messages are persisted to `~/.claude/channels/signal/messag
 
 ## Auto read-receipts (optional)
 
-By default, a sender doesn't know the bridge saw their message until Claude calls `mark_read` (or sends a reply). Flip this with:
+By default, a sender doesn't know the bridge saw their message until Claude calls `mark_read` (or sends a reply). v1.4 supports three modes:
 
 ```
-/signal:configure auto-receipts on
+/signal:configure auto-receipts deferred  # recommended
+/signal:configure auto-receipts eager     # legacy v1.3 behavior
+/signal:configure auto-receipts off       # default
 ```
 
-(Or directly: `SIGNAL_AUTO_READ_RECEIPTS=true` in `.env`.) Every inbound message gets an automatic read receipt as it lands, before Claude has even responded. Own-account syncMessages and message edits are skipped. Think of it as a presence signal: useful for chats where "seen but not yet replied" is friendlier than radio silence, but a privacy regression for chats where you want Claude to choose what to acknowledge.
+- **`deferred`** queues each inbound message and fires the read receipt the first time Claude actually engages with the chat (any tool call). Drains naturally on `reply` / `edit_message` / `react` / `mark_read` / `typing`, plus a 10s poll loop catches engagement-by-other-tools (e.g. Read, Bash). Recommended — recipients see "read" only once Claude has loaded the message into context, not before.
+- **`eager`** acks inbound on receipt, before Claude has responded (the v1.3-and-earlier behavior). Useful if you genuinely want a leading presence signal, but generally awkward UX (recipients see "read" before they see the answer).
+- **`off`** (default): Claude controls reads via the `mark_read` tool.
+
+Stale-receipt protection: deferred entries older than 6 hours are silently dropped at drain time, so a long offline period doesn't flood the sender with backdated receipts when the bridge comes back. The drop counter is visible in `/signal:status`.
+
+**v1.4 breaking change:** legacy `SIGNAL_AUTO_READ_RECEIPTS=true` now means `deferred` (was `eager` in v1.3). Set `=eager` explicitly to keep the old immediate-on-ingestion behavior.
+
+`deferred` requires the engagement hook installed in `~/.claude/settings.json`. The configure subcommand handles both the env var and the hook union.
+
+## Typing indicator (optional)
+
+Show a typing indicator in Signal while a Claude tool is currently in flight, so the recipient knows Claude is mid-task and not just slow.
+
+```
+/signal:configure typing on
+```
+
+The bridge refreshes `sendTyping` every 10s while a tool is executing (start heartbeat newer than end heartbeat) and lets signal-cli's ~15s timeout decay naturally when no tool is running. Long single tool calls (e.g. a 60s Bash) keep the indicator alive the whole duration. Pure thinking time between tools may show brief decays — that's honest signal.
+
+Configured separately from auto-receipts so users can pick either or both.
+
+## Engagement hooks & drift detection
+
+Both deferred receipts and the typing indicator depend on two `Pre/PostToolUse` hooks installed in `~/.claude/settings.json`. The `/signal:configure` subcommands install and remove these atomically — third-party hook entries are preserved exactly. Hooks are per-machine: if you run the bridge on host and container both, run `/signal:configure typing on` (etc.) on each.
+
+If the bridge boots with `SIGNAL_TYPING=true` or `SIGNAL_AUTO_READ_RECEIPTS=deferred` set in `.env` but the matching hook is missing in `settings.json`, you'll see a `[CONFIG DRIFT]` warning on stderr telling you exactly which configure command to run. `/signal:status` surfaces the same cross-check.
 
 ## Permission relay
 

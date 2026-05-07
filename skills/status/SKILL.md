@@ -36,21 +36,57 @@ Build a single multi-section plain-text report. Don't dump JSON; format it for s
 Surface the four behavior toggles so the user can see what's on/off without opening `.env`.
 
 1. **profile name**: resolve `process.env.SIGNAL_PROFILE_NAME` > `.env`'s `SIGNAL_PROFILE_NAME` > default empty (no auto-set). Show the resolved value (or `(disabled, empty)` if empty), label the source.
-2. **auto read-receipts**: resolve `process.env.SIGNAL_AUTO_READ_RECEIPTS` > `.env`'s `SIGNAL_AUTO_READ_RECEIPTS` > unset. Interpret as **on** if the literal lowercase value is `true`, otherwise **off**. Label the source.
-3. **append signature**: same precedence + same `=== 'true'` semantics for `SIGNAL_APPEND_SIGNATURE`.
-4. **access mode**: resolve `process.env.SIGNAL_ACCESS_MODE` > `.env`'s `SIGNAL_ACCESS_MODE` > unset. Show `static (frozen)` if the value is `static`, otherwise `dynamic` (default). Label the source.
-5. **history**: resolve `process.env.SIGNAL_DISABLE_HISTORY` > `.env`'s `SIGNAL_DISABLE_HISTORY` > unset. Show `disabled` if the literal lowercase value is `true`, otherwise `enabled` (default). Label the source.
+2. **auto read-receipts**: tri-state. Resolve `process.env.SIGNAL_AUTO_READ_RECEIPTS` > `.env`'s `SIGNAL_AUTO_READ_RECEIPTS` > unset. Canonicalize: `eager` → `eager`; `deferred`/`true` → `deferred`; anything else → `off`. Label the source. (Note: legacy `true` was eager pre-v1.4; now means deferred.)
+3. **typing indicator**: resolve `process.env.SIGNAL_TYPING` > `.env`'s `SIGNAL_TYPING` > unset. Interpret as **on** if the literal lowercase value is `true`, otherwise **off**. Label the source.
+4. **append signature**: same precedence + same `=== 'true'` semantics for `SIGNAL_APPEND_SIGNATURE`.
+5. **access mode**: resolve `process.env.SIGNAL_ACCESS_MODE` > `.env`'s `SIGNAL_ACCESS_MODE` > unset. Show `static (frozen)` if the value is `static`, otherwise `dynamic` (default). Label the source.
+6. **history**: resolve `process.env.SIGNAL_DISABLE_HISTORY` > `.env`'s `SIGNAL_DISABLE_HISTORY` > unset. Show `disabled` if the literal lowercase value is `true`, otherwise `enabled` (default). Label the source.
 
 Format each as a single line, e.g.:
 ```
 profile name:        (disabled, empty)  (default)
-auto read-receipts:  off                (default)
+auto read-receipts:  deferred           (.env)
+typing indicator:    off                (default)
 append signature:    on                 (.env)
 access mode:         dynamic            (default)
 history:             enabled            (default)
 ```
 
-Mention `/signal:configure auto-receipts on|off`, `signature on|off`, `profile-name <name>` as the way to change these.
+Mention `/signal:configure auto-receipts off|eager|deferred`, `typing on|off`, `signature on|off`, `profile-name <name>` as the way to change these.
+
+### Hooks & runtime
+
+Surface engagement-hook installation and bridge liveness. Both features
+(typing indicator, deferred read-receipts) depend on hook entries in
+`~/.claude/settings.json` plus a live bridge poll loop. This section flags
+drift between the env config and the installed hooks, and surfaces the
+bridge's runtime queue depth.
+
+1. Read `~/.claude/settings.json` if it exists (treat ENOENT as empty).
+   Substring-match the raw text for two sentinels:
+   - `signal/tool-start.heartbeat` (PreToolUse hook present)
+   - `signal/tool-end.heartbeat` (PostToolUse hook present)
+
+2. Cross-check against the resolved env values from the Settings section:
+   - **typing**: env says on, hooks present? Render `env=on, hooks=installed ✓`.
+     If env on but either sentinel missing → `env=on, hooks=MISSING ⚠ run /signal:configure typing on`.
+   - **auto-receipts deferred**: env says deferred, Pre sentinel present? Render `env=deferred, Pre hook=installed ✓`.
+     If env deferred but Pre sentinel missing → `env=deferred, Pre hook=MISSING ⚠ run /signal:configure auto-receipts deferred`.
+   - For env=eager or env=off (and typing=off), no hook is required; render concise status without warnings.
+
+3. Read `~/.claude/channels/signal/runtime-status.json` (atomically written
+   by the bridge every 10s). Schema: `{pendingChats, pendingTotal, ttlDropped, lastPollAt}`.
+   - File missing → `pendingReads: bridge starting (no runtime status yet)`. NOT "unhealthy" — cold start is fine.
+   - `now - lastPollAt > 60_000` ms → `pendingReads: bridge not running or unhealthy (last poll <X>s ago)`.
+   - Else → `pendingReads: <pendingChats> queues, <pendingTotal> entries (<ttlDropped> dropped via 6h TTL)`.
+
+Format example:
+```
+typing:        env=on, hooks=installed ✓
+auto-receipts: env=deferred, Pre hook=MISSING ⚠
+               → run /signal:configure auto-receipts deferred
+pendingReads:  3 queues, 7 entries (0 dropped via 6h TTL)
+```
 
 ### Access
 

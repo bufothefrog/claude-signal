@@ -27,7 +27,8 @@ SIGNAL_OWNER=+15551234567             # owner for permission relay; defaults to 
 SIGNAL_CLI_PATH=/path/to/signal-cli   # optional
 SIGNAL_CLI_CONFIG=/path/to/data       # optional
 SIGNAL_PROFILE_NAME=                  # profile name shown to recipients; empty by default (no auto-set)
-SIGNAL_AUTO_READ_RECEIPTS=false       # auto-ack inbound messages without waiting for Claude's reply
+SIGNAL_AUTO_READ_RECEIPTS=off         # off | eager | deferred. Legacy `true` is parsed as `deferred` (v1.4 breaking change).
+SIGNAL_TYPING=false                   # show typing indicator while a Claude tool is in flight (requires hook install)
 SIGNAL_APPEND_SIGNATURE=false         # append a "via Claude" footer to outbound replies
 SIGNAL_DISABLE_HISTORY=false          # skip the SQLite message-history database entirely
 SIGNAL_ACCESS_MODE=                   # set to "static" to freeze access.json into read-only (deploy mode)
@@ -125,7 +126,8 @@ Saved. Restart your Claude Code session for the bridge to pick this up.
 
 Optional next steps (each takes effect on the next restart):
   /signal:configure profile-name <name>     display name shown to recipients
-  /signal:configure auto-receipts on        auto-ack inbound messages
+  /signal:configure auto-receipts deferred  ack inbound when Claude engages (recommended)
+  /signal:configure typing on               show typing indicator during tool calls
   /signal:configure signature on            append "via Claude" footer to outbound
   /signal:configure history off             disable SQLite message history
   /signal:configure service                 print a starter systemd user unit
@@ -162,16 +164,132 @@ Same shape as `account <number>` but writes `SIGNAL_OWNER=`. Validates the same 
 
 Same shape as `account clear` but for `SIGNAL_OWNER=`. Note that the runtime falls back to `SIGNAL_ACCOUNT` after this.
 
-### `auto-receipts <on|off>`
+### `auto-receipts <off|eager|deferred>`
 
-Toggle `SIGNAL_AUTO_READ_RECEIPTS`. When on, every inbound message is auto-acked as it lands; recipients see the "read" tick before Claude has even responded. Default is off (Claude controls what gets acknowledged via the `mark_read` tool).
+Set `SIGNAL_AUTO_READ_RECEIPTS`. Three modes:
+
+- `off` (default): Claude controls reads via the `mark_read` tool.
+- `deferred`: inbound messages are queued; the read receipt fires the first time Claude engages with the chat (any tool call). Recommended — receipts arrive when Claude has actually seen the message, not before.
+- `eager`: legacy v1.3 behavior. Every inbound is auto-acked on receipt, before Claude has responded. Generally awkward UX (recipient sees "read" before they see the answer).
+
+**v1.4 breaking change:** legacy `=true` is parsed as `=deferred`, not `=eager`. Set `=eager` explicitly to keep the old immediate-on-ingestion behavior.
+
+`deferred` requires the engagement hook installed in `~/.claude/settings.json`. This subcommand handles both the env var and the hook union together.
+
+1. Validate the arg matches `^(off|eager|deferred|on|true|false|yes|no)$` case-insensitively. Reject otherwise.
+2. Canonicalize:
+   - `off`, `false`, `no` → `off`
+   - `eager` → `eager`
+   - `deferred`, `on`, `true`, `yes` → `deferred` (and print a one-line note if the user typed `on`/`true`/`yes`: "treating as `deferred`; v1.4 split eager vs deferred")
+3. mkdir -p the channels dir.
+4. Read existing `.env` if present. Update or insert the `SIGNAL_AUTO_READ_RECEIPTS=` line, preserve every other line and ordering.
+5. Atomic write: tmp file in same dir, `chmod 600`, `rename` over `.env`.
+6. Run the **engagement-hook union-recompute** below.
+7. Confirm + remind that bridge picks up `.env` on next session restart; hooks take effect immediately on next tool call.
+
+### `typing <on|off>`
+
+Toggle `SIGNAL_TYPING`. When on, the bridge shows a Signal typing indicator while a Claude tool is currently in flight (refreshed every 10s; decays naturally via signal-cli's ~15s timeout when no tool is running). Requires the engagement hook pair (Pre + PostToolUse) installed.
 
 1. Validate the arg matches `^(on|off|true|false|yes|no)$` case-insensitively. Reject otherwise.
 2. Canonicalize: `on`/`true`/`yes` → `true`; `off`/`false`/`no` → `false`.
 3. mkdir -p the channels dir.
-4. Read existing `.env` if present. Update or insert the `SIGNAL_AUTO_READ_RECEIPTS=` line, preserve every other line and ordering.
+4. Read existing `.env` if present. Update or insert the `SIGNAL_TYPING=` line, preserve every other line and ordering.
 5. Atomic write: tmp file in same dir, `chmod 600`, `rename` over `.env`.
-6. Confirm + remind that it takes effect on next session restart.
+6. Run the **engagement-hook union-recompute** below.
+7. Confirm + remind that bridge picks up `.env` on next session restart; hooks take effect immediately on next tool call.
+
+### Engagement-hook union-recompute
+
+Both `auto-receipts` and `typing` share two heartbeat files in `~/.claude/channels/signal/`. The bridge reads their mtimes via the 10s poll loop:
+
+- `tool-start.heartbeat` — touched by a `PreToolUse` hook. Drives both features.
+- `tool-end.heartbeat` — touched by a `PostToolUse` hook. Drives typing only (typing is "in flight" iff `start > end`).
+
+After every `auto-receipts` or `typing` write, recompute which hooks should be installed in `~/.claude/settings.json` by reading the freshly-written `.env` and computing the union:
+
+- Pre hook installed iff `SIGNAL_TYPING=true` OR `SIGNAL_AUTO_READ_RECEIPTS=deferred`
+- Post hook installed iff `SIGNAL_TYPING=true`
+
+Run the script below via `bun -e`. It does an idempotent merge against settings.json — adds our entries when needed, removes ours when not, never touches third-party hooks.
+
+```sh
+bun -e '
+const fs = require("fs"), os = require("os"), path = require("path")
+const envPath = path.join(os.homedir(), ".claude", "channels", "signal", ".env")
+const settingsPath = path.join(os.homedir(), ".claude", "settings.json")
+
+let envText = ""
+try { envText = fs.readFileSync(envPath, "utf8") } catch {}
+const env = {}
+for (const line of envText.split("\n")) {
+  const t = line.trim()
+  if (!t || t.startsWith("#")) continue
+  const eq = t.indexOf("=")
+  if (eq < 0) continue
+  env[t.slice(0, eq).trim()] = t.slice(eq + 1).trim()
+}
+
+const typingOn = env.SIGNAL_TYPING === "true"
+const mode = (env.SIGNAL_AUTO_READ_RECEIPTS ?? "").toLowerCase()
+const deferredOn = mode === "deferred" || mode === "true"
+const needPre  = typingOn || deferredOn
+const needPost = typingOn
+
+let settings = {}
+try {
+  const raw = fs.readFileSync(settingsPath, "utf8")
+  settings = raw.trim() ? JSON.parse(raw) : {}
+} catch (err) {
+  if (err.code !== "ENOENT") {
+    console.error("error: " + settingsPath + " unreadable or invalid JSON: " + err.message)
+    process.exit(1)
+  }
+}
+settings.hooks = settings.hooks || {}
+
+const startCmd = "bash -c '\''mkdir -p \"$HOME/.claude/channels/signal\" && touch \"$HOME/.claude/channels/signal/tool-start.heartbeat\"'\''"
+const endCmd   = "bash -c '\''mkdir -p \"$HOME/.claude/channels/signal\" && touch \"$HOME/.claude/channels/signal/tool-end.heartbeat\"'\''"
+const startSentinel = "signal/tool-start.heartbeat"
+const endSentinel   = "signal/tool-end.heartbeat"
+
+function ensureHook(event, sentinel, cmd, want) {
+  const arr = settings.hooks[event] = settings.hooks[event] || []
+  let block = arr.find(b => b && b.matcher === "*")
+  if (!block && want) { block = { matcher: "*", hooks: [] }; arr.push(block) }
+  if (!block) return
+  block.hooks = block.hooks || []
+  const idx = block.hooks.findIndex(h => typeof h?.command === "string" && h.command.includes(sentinel))
+  if (want && idx < 0) block.hooks.push({ type: "command", command: cmd })
+  else if (!want && idx >= 0) {
+    block.hooks.splice(idx, 1)
+    if (block.hooks.length === 0) {
+      const i = arr.indexOf(block); if (i >= 0) arr.splice(i, 1)
+    }
+  }
+  if (arr.length === 0) delete settings.hooks[event]
+}
+ensureHook("PreToolUse",  startSentinel, startCmd, needPre)
+ensureHook("PostToolUse", endSentinel,   endCmd,   needPost)
+
+const tmp = settingsPath + ".tmp"
+fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+fs.writeFileSync(tmp, JSON.stringify(settings, null, 2) + "\n", { mode: 0o644 })
+fs.renameSync(tmp, settingsPath)
+
+const finalRaw = fs.readFileSync(settingsPath, "utf8")
+const hasStart = finalRaw.includes(startSentinel)
+const hasEnd = finalRaw.includes(endSentinel)
+console.log(`typing:        ${typingOn ? "on" : "off"} (hooks: pre=${hasStart ? "installed" : "missing"}, post=${hasEnd ? "installed" : "missing"})`)
+console.log(`auto-receipts: ${mode || "off"} (pre hook: ${hasStart ? "installed" : "missing"})`)
+
+if (deferredOn && !hasStart) console.error("warning: deferred receipts enabled but Pre hook missing — queued reads will not drain")
+if (typingOn && !(hasStart && hasEnd)) console.error("warning: typing enabled but hooks incomplete — typing will not fire")
+if (process.env.SIGNAL_STATE_DIR) console.error("warning: SIGNAL_STATE_DIR=" + process.env.SIGNAL_STATE_DIR + " is set, but hook commands hardcode $HOME/.claude/channels/signal/. Edit settings.json by hand if needed.")
+'
+```
+
+After running, echo a one-line "per-machine reminder" to the user: "Hooks live in `~/.claude/settings.json` per machine — run this on host and container separately if you use both." If you detect drift via the script's warnings, surface them prominently.
 
 ### `signature <on|off>`
 
@@ -271,4 +389,6 @@ Notes to surface:
 - The server reads `.env` once at boot. All changes (account, owner, toggles, profile-name) take effect on session restart or `/reload-plugins`. Say so after saving.
 - `access.json` is a separate file managed by `/signal:access`. Don't touch it from here. `dmPolicy` (pairing/allowlist/disabled) lives there and changes apply at runtime; `SIGNAL_ACCESS_MODE=static` is a separate boot-time freeze that belongs in `.env` and is not currently exposed as a subcommand. Set it via direct `.env` edit if needed.
 - Always preserve unknown keys in `.env`. Forward-compat for keys this skill doesn't know about.
-- The bridge interprets `SIGNAL_AUTO_READ_RECEIPTS` and `SIGNAL_APPEND_SIGNATURE` strictly as `=== 'true'`. Anything other than the literal lowercase `true` reads as off. Canonicalize to `true`/`false` (lowercase) when writing.
+- The bridge interprets `SIGNAL_APPEND_SIGNATURE`, `SIGNAL_TYPING`, and `SIGNAL_DISABLE_HISTORY` strictly as `=== 'true'`. Anything other than the literal lowercase `true` reads as off. Canonicalize to `true`/`false` (lowercase) when writing.
+- `SIGNAL_AUTO_READ_RECEIPTS` is tri-state. Canonical values: `off`, `eager`, `deferred`. Legacy `true` is parsed as `deferred` (v1.4 breaking change from v1.3 where `true` meant `eager`).
+- `auto-receipts deferred` and `typing on` both depend on hook entries in `~/.claude/settings.json`. The shared union-recompute is the single source of truth — never edit those entries by hand and expect them to survive a future toggle. Third-party hook entries (anything that doesn't contain `signal/tool-start.heartbeat` or `signal/tool-end.heartbeat`) are preserved exactly.
