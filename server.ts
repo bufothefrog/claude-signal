@@ -91,6 +91,19 @@ function parseEnvFile(path: string): Record<string, string> {
 
 const envFile = parseEnvFile(ENV_FILE)
 
+// Resolve own version from the plugin's package.json. `import.meta.dir`
+// resolves to the directory containing this file at runtime under bun.
+const VERSION = ((): string => {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(join(import.meta.dir, 'package.json'), 'utf8'),
+    )
+    return typeof pkg.version === 'string' ? pkg.version : 'unknown'
+  } catch {
+    return 'unknown'
+  }
+})()
+
 const SIGNAL_CLI =
   process.env.SIGNAL_CLI_PATH ?? envFile.SIGNAL_CLI_PATH ?? 'signal-cli'
 const SIGNAL_CONFIG =
@@ -1450,6 +1463,7 @@ function writeRuntimeStatus(): void {
   let pendingTotal = 0
   for (const entries of pendingReads.values()) pendingTotal += entries.length
   const snapshot = {
+    version: VERSION,
     pendingChats: pendingReads.size,
     pendingTotal,
     ttlDropped: RECEIPT_TTL_DROPPED_TOTAL,
@@ -2537,6 +2551,8 @@ for (const sig of ['SIGTERM', 'SIGINT'] as const) {
 }
 
 // --- startup orchestration ---------------------------------------------------
+
+process.stderr.write(`signal channel: v${VERSION} booting (${import.meta.dir})\n`)
 
 // Cleanup BEFORE account resolution: `signal-cli listAccounts` itself blocks
 // on the global accounts lock that the orphan holds, so we'd hang at boot.

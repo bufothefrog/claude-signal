@@ -19,6 +19,20 @@ Arguments passed: `$ARGUMENTS` (ignored; this skill is read-only).
 
 Build a single multi-section plain-text report. Don't dump JSON; format it for skimming.
 
+### Version
+
+Print the running bridge version as the very first line of output, so the
+user can confirm what's actually loaded (Claude Code's plugin cache path
+shows the *registered* version, not necessarily the running one).
+
+1. Read `~/.claude/channels/signal/runtime-status.json`. If it exists and
+   has a `version` field, print `bridge: v<version> (running)`.
+2. If the file is missing or stale (`now - lastPollAt > 60s`), the
+   running version is unknown — print `bridge: not running or unhealthy`
+   and skip to the next section.
+3. The "Hooks & runtime" section below still renders the freshness/queue
+   detail; this section is just the headline.
+
 ### Account
 
 1. Read `~/.claude/channels/signal/.env` if it exists (simple `KEY=VALUE`, ignore `#` comments and blank lines).

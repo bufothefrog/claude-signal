@@ -1,7 +1,7 @@
 {
   "name": "signal",
   "description": "Signal channel for Claude Code via signal-cli's JSON-RPC bridge. DMs and groups, attachments, quote-replies, message edits.",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "author": { "name": "bufothefrog" },
   "homepage": "https://github.com/bufothefrog/claude-signal",
   "repository": "https://github.com/bufothefrog/claude-signal",
